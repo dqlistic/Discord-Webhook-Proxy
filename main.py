@@ -907,7 +907,7 @@ INDEX_HTML_TEMPLATE = """
         });
 
         refreshStats();
-        setInterval(refreshStats, 3000);
+        setInterval(refreshStats, 60000);
     </script>
 </body>
 </html>
