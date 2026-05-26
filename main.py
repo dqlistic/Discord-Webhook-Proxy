@@ -20,7 +20,6 @@ import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from redis.exceptions import WatchError
 
 WEBHOOK_PATH_RE = re.compile(r"^/api/webhooks/(\d+)/([A-Za-z0-9_-]+)$")
 FAVICON_PATH = Path(__file__).with_name("favicon.png")
@@ -32,31 +31,37 @@ INDEX_HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Discord Webhook Proxy</title>
-    <meta name="description" content="A Secure, Self-Healing Proxy for Discord Webhooks.">
+    <meta name="description" content="A Friendly, Queue-Safe Relay For Discord Webhooks.">
     <meta property="og:title" content="Discord Webhook Proxy">
-    <meta property="og:description" content="A Secure, Self-Healing Proxy for Discord Webhooks.">
+    <meta property="og:description" content="A Friendly, Queue-Safe Relay For Discord Webhooks.">
     <meta property="og:type" content="website">
     <meta property="og:image" content="/og-image.png">
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="theme-color" content="#5865F2">
+    <meta name="theme-color" content="#6D73FF">
     <link rel="icon" type="image/png" href="/favicon.png">
     <style nonce="__NONCE__">
         :root {
             color-scheme: dark;
-            --bg: #0b0d12;
-            --panel: #1e1f22;
-            --panel-2: #2b2d31;
-            --panel-3: #313338;
-            --border: rgba(255,255,255,0.08);
-            --text: #dbdee1;
-            --muted: #949ba4;
-            --soft: #b5bac1;
-            --blurple: #5865f2;
-            --blurple-dark: #4752c4;
-            --green: #57f287;
-            --red: #ed4245;
-            --yellow: #fee75c;
-            --shadow: 0 28px 80px rgba(0,0,0,0.45);
+            --bg: #0b0d15;
+            --bg-soft: #111522;
+            --card: rgba(24, 28, 43, 0.78);
+            --card-strong: rgba(31, 36, 55, 0.92);
+            --card-soft: rgba(255, 255, 255, 0.055);
+            --border: rgba(255, 255, 255, 0.12);
+            --border-strong: rgba(255, 255, 255, 0.18);
+            --text: #f6f7fb;
+            --muted: #a9b0c3;
+            --soft: #d7dcf0;
+            --accent: #6d73ff;
+            --accent-2: #ff8d8f;
+            --green: #68f2a3;
+            --yellow: #ffd166;
+            --red: #ff6b6b;
+            --shadow: 0 30px 90px rgba(0, 0, 0, 0.42);
+            --radius-xl: 30px;
+            --radius-lg: 22px;
+            --radius-md: 16px;
+            --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
         }
 
         * {
@@ -71,9 +76,10 @@ INDEX_HTML_TEMPLATE = """
             margin: 0;
             min-height: 100vh;
             background:
-                radial-gradient(circle at 20% 12%, rgba(88,101,242,0.25), transparent 34rem),
-                radial-gradient(circle at 88% 8%, rgba(237,66,69,0.18), transparent 28rem),
-                linear-gradient(180deg, #080a0f 0%, var(--bg) 42%, #111318 100%);
+                radial-gradient(circle at 16% 10%, rgba(109, 115, 255, 0.34), transparent 30rem),
+                radial-gradient(circle at 84% 8%, rgba(255, 141, 143, 0.22), transparent 28rem),
+                radial-gradient(circle at 50% 95%, rgba(104, 242, 163, 0.12), transparent 36rem),
+                linear-gradient(180deg, #080a12 0%, var(--bg) 46%, #10131f 100%);
             color: var(--text);
             font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             overflow-x: hidden;
@@ -84,11 +90,11 @@ INDEX_HTML_TEMPLATE = """
             position: fixed;
             inset: 0;
             pointer-events: none;
-            background-image:
-                linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
-            background-size: 38px 38px;
-            mask-image: linear-gradient(to bottom, rgba(0,0,0,0.8), transparent 82%);
+            background:
+                linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+            background-size: 42px 42px;
+            mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.82), transparent 78%);
         }
 
         a {
@@ -96,10 +102,15 @@ INDEX_HTML_TEMPLATE = """
             text-decoration: none;
         }
 
+        button,
+        input {
+            font: inherit;
+        }
+
         .page {
-            width: min(1180px, calc(100% - 32px));
+            width: min(1180px, calc(100% - 36px));
             margin: 0 auto;
-            padding: 26px 0 40px;
+            padding: 28px 0 44px;
             position: relative;
             z-index: 1;
         }
@@ -108,159 +119,162 @@ INDEX_HTML_TEMPLATE = """
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 18px;
-            margin-bottom: 34px;
+            gap: 20px;
+            margin-bottom: 48px;
         }
 
         .brand {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 14px;
             min-width: 0;
         }
 
         .brand-logo {
-            width: 46px;
-            height: 46px;
-            border-radius: 14px;
-            background: rgba(88,101,242,0.13);
-            border: 1px solid rgba(88,101,242,0.25);
-            box-shadow: 0 0 30px rgba(88,101,242,0.25);
+            width: 48px;
+            height: 48px;
+            border-radius: 17px;
+            background: rgba(109, 115, 255, 0.14);
+            border: 1px solid rgba(109, 115, 255, 0.26);
+            box-shadow: 0 0 34px rgba(109, 115, 255, 0.24);
             padding: 7px;
         }
 
-        .brand-title {
+        .brand-text {
             display: grid;
-            gap: 2px;
+            gap: 3px;
         }
 
-        .brand-title strong {
+        .brand-text strong {
+            color: #fff;
             font-size: 15px;
             letter-spacing: 0.01em;
-            color: #fff;
         }
 
-        .brand-title span {
+        .brand-text span {
             color: var(--muted);
             font-size: 12px;
+            line-height: 1.35;
         }
 
         .nav-actions {
             display: flex;
             align-items: center;
+            justify-content: flex-end;
             gap: 10px;
             flex-wrap: wrap;
-            justify-content: flex-end;
         }
 
         .pill-link {
             display: inline-flex;
             align-items: center;
             gap: 9px;
-            padding: 10px 13px;
+            min-height: 42px;
+            padding: 0 15px;
             border-radius: 999px;
             border: 1px solid var(--border);
-            background: rgba(30,31,34,0.78);
+            background: rgba(24, 28, 43, 0.62);
             color: var(--soft);
             font-size: 13px;
-            font-weight: 700;
-            transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+            font-weight: 800;
+            transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease;
         }
 
         .pill-link:hover {
             transform: translateY(-1px);
-            border-color: rgba(88,101,242,0.45);
-            background: rgba(43,45,49,0.95);
+            border-color: rgba(109, 115, 255, 0.48);
+            background: rgba(31, 36, 55, 0.92);
         }
 
-        .github-cat {
-            position: relative;
+        .github-mark {
             width: 20px;
             height: 20px;
             display: inline-grid;
             place-items: center;
         }
 
-        .github-cat svg {
+        .github-mark svg {
             width: 20px;
             height: 20px;
         }
 
-        .github-cat .paw {
-            transform-origin: 15px 7px;
-            animation: paw-wave 7.5s ease-in-out infinite;
-        }
-
-        @keyframes paw-wave {
-            0%, 72%, 100% { transform: rotate(0deg); }
-            76% { transform: rotate(-24deg); }
-            80% { transform: rotate(18deg); }
-            84% { transform: rotate(-18deg); }
-            88% { transform: rotate(12deg); }
-            92% { transform: rotate(0deg); }
-        }
-
         .hero {
             display: grid;
-            grid-template-columns: minmax(0, 1.02fr) minmax(320px, 0.98fr);
-            gap: 28px;
+            grid-template-columns: minmax(0, 0.95fr) minmax(360px, 1.05fr);
+            gap: 34px;
             align-items: center;
         }
 
         .hero-copy {
-            padding: 26px 4px;
+            padding: 18px 0;
         }
 
         .eyebrow {
             display: inline-flex;
             align-items: center;
-            gap: 8px;
-            color: var(--green);
-            background: rgba(87,242,135,0.08);
-            border: 1px solid rgba(87,242,135,0.18);
+            gap: 9px;
+            margin-bottom: 20px;
+            padding: 9px 13px;
             border-radius: 999px;
-            padding: 8px 11px;
+            border: 1px solid rgba(104, 242, 163, 0.22);
+            background: rgba(104, 242, 163, 0.09);
+            color: var(--green);
             font-size: 12px;
-            font-weight: 800;
+            font-weight: 900;
             letter-spacing: 0.04em;
             text-transform: uppercase;
         }
 
-        .pulse {
+        .status-dot {
             width: 8px;
             height: 8px;
             border-radius: 999px;
             background: var(--green);
-            box-shadow: 0 0 18px rgba(87,242,135,0.65);
-            animation: pulse 1.8s infinite;
+            box-shadow: 0 0 18px rgba(104, 242, 163, 0.72);
+            animation: pulse 1.9s ease-in-out infinite;
         }
 
         @keyframes pulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.55; transform: scale(0.72); }
+            0%, 100% {
+                opacity: 1;
+                transform: scale(1);
+            }
+
+            50% {
+                opacity: 0.55;
+                transform: scale(0.76);
+            }
+        }
+
+        h1,
+        h2,
+        h3,
+        p {
+            margin-top: 0;
         }
 
         h1 {
-            margin: 18px 0 14px;
+            max-width: 780px;
+            margin-bottom: 20px;
             color: #fff;
-            font-size: clamp(42px, 7vw, 78px);
-            line-height: 0.93;
-            letter-spacing: -0.06em;
+            font-size: clamp(42px, 6.4vw, 76px);
+            line-height: 0.96;
+            letter-spacing: -0.058em;
         }
 
         .gradient-text {
-            background: linear-gradient(90deg, #fff 0%, #d9dcff 36%, #8087ff 70%, #ff7577 100%);
+            background: linear-gradient(92deg, #ffffff 0%, #e7e9ff 34%, #9fa5ff 64%, #ffabad 100%);
             -webkit-background-clip: text;
             background-clip: text;
             color: transparent;
         }
 
         .hero-copy p {
-            color: var(--soft);
-            line-height: 1.72;
-            font-size: 16px;
             max-width: 640px;
-            margin: 0 0 22px;
+            margin-bottom: 24px;
+            color: var(--soft);
+            font-size: 16px;
+            line-height: 1.78;
         }
 
         .hero-badges {
@@ -270,32 +284,36 @@ INDEX_HTML_TEMPLATE = """
         }
 
         .mini-badge {
+            display: inline-flex;
+            align-items: center;
+            min-height: 34px;
+            padding: 0 12px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.052);
             color: var(--muted);
             font-size: 12px;
-            border: 1px solid var(--border);
-            background: rgba(30,31,34,0.72);
-            border-radius: 999px;
-            padding: 8px 10px;
-            font-weight: 700;
+            font-weight: 800;
         }
 
-        .terminal {
-            border-radius: 22px;
+        .panel {
             overflow: hidden;
-            background: rgba(30,31,34,0.88);
-            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: var(--radius-xl);
+            border: 1px solid var(--border);
+            background: linear-gradient(180deg, rgba(31, 36, 55, 0.94), rgba(18, 22, 35, 0.9));
             box-shadow: var(--shadow);
-            backdrop-filter: blur(18px);
+            backdrop-filter: blur(20px);
         }
 
-        .terminal-bar {
-            height: 48px;
-            background: rgba(17,18,20,0.88);
+        .panel-bar {
+            min-height: 54px;
             display: grid;
             grid-template-columns: 1fr auto 1fr;
             align-items: center;
-            padding: 0 16px;
-            border-bottom: 1px solid rgba(255,255,255,0.06);
+            gap: 14px;
+            padding: 0 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(8, 10, 18, 0.46);
         }
 
         .lights {
@@ -306,50 +324,68 @@ INDEX_HTML_TEMPLATE = """
         .light {
             width: 12px;
             height: 12px;
-            border-radius: 50%;
+            border-radius: 999px;
         }
 
-        .light.red { background: var(--red); box-shadow: 0 0 12px rgba(237,66,69,0.45); }
-        .light.yellow { background: var(--yellow); box-shadow: 0 0 12px rgba(254,231,92,0.45); }
-        .light.green { background: var(--green); box-shadow: 0 0 12px rgba(87,242,135,0.45); }
+        .light.red {
+            background: var(--red);
+        }
 
-        .terminal-title {
+        .light.yellow {
+            background: var(--yellow);
+        }
+
+        .light.green {
+            background: var(--green);
+        }
+
+        .panel-title {
             color: var(--muted);
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+            font-family: var(--mono);
             font-size: 12px;
             letter-spacing: 0.08em;
+            white-space: nowrap;
         }
 
         .compiler {
-            padding: 24px;
+            padding: clamp(22px, 4vw, 34px);
+        }
+
+        .compiler-header {
+            margin-bottom: 26px;
         }
 
         .compiler h2 {
+            margin-bottom: 9px;
             color: #fff;
-            margin: 0 0 7px;
-            font-size: 22px;
-            letter-spacing: -0.02em;
+            font-size: clamp(24px, 3vw, 32px);
+            letter-spacing: -0.035em;
         }
 
         .compiler-subtitle {
+            max-width: 580px;
+            margin-bottom: 0;
             color: var(--muted);
-            margin: 0 0 22px;
             font-size: 14px;
-            line-height: 1.6;
+            line-height: 1.68;
+        }
+
+        .form-stack {
+            display: grid;
+            gap: 22px;
         }
 
         .field {
             display: grid;
-            gap: 9px;
-            margin-bottom: 18px;
+            gap: 11px;
         }
 
         .field label {
-            color: var(--muted);
-            font-size: 11px;
+            color: var(--soft);
+            font-size: 12px;
             font-weight: 900;
+            letter-spacing: 0.1em;
             text-transform: uppercase;
-            letter-spacing: 0.12em;
         }
 
         .input-wrap {
@@ -358,51 +394,59 @@ INDEX_HTML_TEMPLATE = """
 
         .prompt {
             position: absolute;
-            left: 14px;
+            left: 15px;
             top: 50%;
             transform: translateY(-50%);
-            color: var(--blurple);
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-            font-weight: 800;
+            color: var(--accent);
+            font-family: var(--mono);
+            font-weight: 900;
+            pointer-events: none;
         }
 
         input {
             width: 100%;
-            min-height: 52px;
-            border-radius: 14px;
-            border: 1px solid rgba(255,255,255,0.08);
-            background: #111214;
+            min-height: 58px;
+            border-radius: 18px;
+            border: 1px solid rgba(255, 255, 255, 0.105);
+            background: rgba(8, 10, 18, 0.74);
             color: var(--green);
             outline: none;
-            padding: 14px 112px 14px 34px;
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+            padding: 16px 18px 16px 38px;
+            font-family: var(--mono);
             font-size: 13px;
-            transition: border-color 0.18s ease, box-shadow 0.18s ease;
+            line-height: 1.4;
+            transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
         }
 
         input::placeholder {
-            color: #5f6570;
+            color: #697085;
         }
 
         input:focus {
-            border-color: rgba(88,101,242,0.85);
-            box-shadow: 0 0 0 4px rgba(88,101,242,0.13);
+            border-color: rgba(109, 115, 255, 0.9);
+            background: rgba(8, 10, 18, 0.92);
+            box-shadow: 0 0 0 4px rgba(109, 115, 255, 0.16);
+        }
+
+        .output-input {
+            padding-right: 112px;
         }
 
         .button {
-            border: 0;
-            cursor: pointer;
-            border-radius: 14px;
-            min-height: 52px;
-            display: inline-flex;
-            justify-content: center;
-            align-items: center;
-            gap: 10px;
-            font-weight: 900;
-            color: #fff;
-            background: linear-gradient(135deg, var(--blurple), var(--blurple-dark));
-            box-shadow: 0 14px 32px rgba(88,101,242,0.27);
             width: 100%;
+            min-height: 58px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            border: 0;
+            border-radius: 18px;
+            background: linear-gradient(135deg, var(--accent), #5259df);
+            color: #fff;
+            box-shadow: 0 18px 34px rgba(109, 115, 255, 0.3);
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: 950;
             transition: transform 0.18s ease, filter 0.18s ease;
         }
 
@@ -413,176 +457,185 @@ INDEX_HTML_TEMPLATE = """
 
         .copy-button {
             position: absolute;
-            right: 6px;
-            top: 6px;
-            bottom: 6px;
-            width: 94px;
-            border-radius: 10px;
-            border: 1px solid rgba(255,255,255,0.08);
+            top: 7px;
+            right: 7px;
+            bottom: 7px;
+            width: 92px;
+            border: 1px solid rgba(255, 255, 255, 0.11);
+            border-radius: 13px;
+            background: rgba(255, 255, 255, 0.092);
             color: #fff;
-            background: var(--panel-2);
-            font-weight: 900;
             cursor: pointer;
+            font-size: 14px;
+            font-weight: 950;
+            transition: background 0.18s ease, transform 0.18s ease;
         }
 
         .copy-button:hover {
-            background: var(--panel-3);
+            background: rgba(255, 255, 255, 0.14);
+            transform: translateY(-1px);
         }
 
         .error {
             display: none;
-            color: #ff8587;
+            color: #ffabad;
             font-size: 12px;
-            font-weight: 800;
+            font-weight: 850;
+            line-height: 1.45;
         }
 
         .error.visible {
             display: block;
         }
 
+        .helper {
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.58;
+        }
+
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 14px;
-            margin-top: 22px;
+            margin-top: 28px;
         }
 
         .stat-card {
-            padding: 16px;
-            border: 1px solid rgba(255,255,255,0.08);
-            background: rgba(17,18,20,0.58);
-            border-radius: 16px;
+            min-height: 112px;
+            display: grid;
+            align-content: center;
+            gap: 7px;
+            padding: 18px;
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.09);
+            background: rgba(255, 255, 255, 0.055);
         }
 
         .stat-card strong {
-            display: block;
             color: #fff;
-            font-size: clamp(24px, 3vw, 32px);
-            letter-spacing: -0.04em;
+            font-size: clamp(26px, 3vw, 34px);
+            line-height: 1;
+            letter-spacing: -0.045em;
         }
 
         .stat-card span {
             color: var(--muted);
             font-size: 12px;
-            font-weight: 800;
-            line-height: 1.35;
+            font-weight: 850;
+            line-height: 1.38;
         }
 
         .section {
             margin-top: 34px;
-            border: 1px solid rgba(255,255,255,0.08);
-            background: rgba(30,31,34,0.68);
-            border-radius: 24px;
-            padding: 24px;
-            box-shadow: 0 18px 60px rgba(0,0,0,0.22);
+            padding: clamp(22px, 3.4vw, 34px);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-xl);
+            background: rgba(24, 28, 43, 0.58);
+            box-shadow: 0 18px 62px rgba(0, 0, 0, 0.22);
+            backdrop-filter: blur(14px);
         }
 
         .section-header {
-            display: flex;
-            justify-content: space-between;
-            gap: 16px;
-            align-items: end;
-            margin-bottom: 18px;
+            max-width: 760px;
+            margin-bottom: 24px;
         }
 
         .section h2 {
+            margin-bottom: 10px;
             color: #fff;
-            margin: 0;
-            font-size: clamp(24px, 3vw, 34px);
-            letter-spacing: -0.04em;
+            font-size: clamp(25px, 3.2vw, 38px);
+            line-height: 1.06;
+            letter-spacing: -0.045em;
         }
 
         .section-header p {
-            margin: 6px 0 0;
+            margin-bottom: 0;
             color: var(--muted);
-            line-height: 1.6;
-            max-width: 680px;
+            font-size: 15px;
+            line-height: 1.7;
+        }
+
+        .cards,
+        .privacy-grid,
+        .rules-grid {
+            display: grid;
+            gap: 14px;
         }
 
         .cards {
-            display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 14px;
         }
 
-        .info-card {
-            border: 1px solid rgba(255,255,255,0.08);
-            background: rgba(17,18,20,0.45);
-            border-radius: 18px;
-            padding: 17px;
-            min-height: 146px;
+        .privacy-grid,
+        .rules-grid {
+            grid-template-columns: repeat(3, 1fr);
         }
 
-        .info-card .icon {
-            width: 34px;
-            height: 34px;
-            border-radius: 11px;
+        .info-card,
+        .privacy-card,
+        .rule-card {
+            min-height: 150px;
+            padding: 19px;
+            border: 1px solid rgba(255, 255, 255, 0.09);
+            border-radius: 22px;
+            background: rgba(255, 255, 255, 0.052);
+        }
+
+        .icon {
+            width: 38px;
+            height: 38px;
             display: grid;
             place-items: center;
-            background: rgba(88,101,242,0.13);
-            color: #cdd1ff;
-            margin-bottom: 14px;
+            margin-bottom: 16px;
+            border-radius: 14px;
+            background: rgba(109, 115, 255, 0.14);
+            color: #dfe1ff;
+            font-size: 18px;
         }
 
-        .info-card h3 {
+        .info-card h3,
+        .privacy-card h3,
+        .rule-card h3 {
+            margin-bottom: 8px;
             color: #fff;
-            margin: 0 0 7px;
             font-size: 15px;
+            line-height: 1.25;
         }
 
-        .info-card p {
+        .info-card p,
+        .privacy-card p,
+        .rule-card p {
+            margin-bottom: 0;
             color: var(--muted);
-            margin: 0;
             font-size: 13px;
-            line-height: 1.58;
-        }
-
-        .privacy-grid, .rules-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 14px;
-        }
-
-        .privacy-card, .rule-card {
-            border: 1px solid rgba(255,255,255,0.08);
-            background: rgba(17,18,20,0.45);
-            border-radius: 18px;
-            padding: 18px;
-        }
-
-        .privacy-card h3, .rule-card h3 {
-            color: #fff;
-            margin: 0 0 10px;
-            font-size: 15px;
-        }
-
-        .privacy-card p, .rule-card p {
-            color: var(--muted);
-            margin: 0;
-            line-height: 1.58;
-            font-size: 13px;
+            line-height: 1.62;
         }
 
         .footer {
-            margin-top: 30px;
-            padding: 22px 0 4px;
             display: flex;
-            align-items: center;
             justify-content: space-between;
+            align-items: center;
             gap: 16px;
+            flex-wrap: wrap;
+            margin-top: 30px;
+            padding: 22px 2px 4px;
             color: var(--muted);
             font-size: 13px;
-            flex-wrap: wrap;
+        }
+
+        .footer strong {
+            color: #fff;
+        }
+
+        .online {
+            color: var(--green);
         }
 
         .credit {
             display: inline-flex;
             gap: 8px;
             flex-wrap: wrap;
-        }
-
-        .credit strong {
-            color: #fff;
         }
 
         @media (max-width: 980px) {
@@ -594,41 +647,73 @@ INDEX_HTML_TEMPLATE = """
                 grid-template-columns: repeat(2, 1fr);
             }
 
-            .privacy-grid, .rules-grid {
+            .privacy-grid,
+            .rules-grid {
                 grid-template-columns: 1fr;
             }
         }
 
-        @media (max-width: 680px) {
+        @media (max-width: 700px) {
             .page {
                 width: min(100% - 22px, 1180px);
                 padding-top: 18px;
             }
 
-            .nav, .section-header {
+            .nav {
                 align-items: flex-start;
                 flex-direction: column;
+                margin-bottom: 34px;
             }
 
             .nav-actions {
                 justify-content: flex-start;
             }
 
+            .brand-logo {
+                width: 44px;
+                height: 44px;
+            }
+
+            .panel-bar {
+                grid-template-columns: 1fr;
+                justify-items: start;
+                padding: 14px 18px;
+            }
+
+            .panel-bar > span:last-child {
+                display: none;
+            }
+
             .compiler {
-                padding: 18px;
+                padding: 20px;
+            }
+
+            .form-stack {
+                gap: 20px;
             }
 
             input {
-                padding-right: 94px;
+                min-height: 56px;
                 font-size: 12px;
             }
 
-            .copy-button {
-                width: 78px;
+            .output-input {
+                padding-right: 92px;
             }
 
-            .stats-grid, .cards {
+            .copy-button {
+                width: 76px;
+                font-size: 13px;
+            }
+
+            .stats-grid,
+            .cards {
                 grid-template-columns: 1fr;
+            }
+
+            .footer {
+                align-items: flex-start;
+                flex-direction: column;
             }
         }
     </style>
@@ -636,20 +721,19 @@ INDEX_HTML_TEMPLATE = """
 <body>
     <main class="page">
         <nav class="nav" aria-label="Primary">
-            <a class="brand" href="/" aria-label="Discord Webhook Proxy home">
+            <a class="brand" href="/" aria-label="Discord Webhook Proxy Home">
                 <img class="brand-logo" src="/favicon.png" alt="">
-                <span class="brand-title">
+                <span class="brand-text">
                     <strong>Discord Webhook Proxy</strong>
-                    <span>Queue-safe relay for Discord webhook workloads</span>
+                    <span>A calmer path for busy webhook traffic</span>
                 </span>
             </a>
             <div class="nav-actions">
                 <a class="pill-link" href="https://devforum.roblox.com/t/release-discord-webhook-proxy-your-webhooks-turbocharged/4647835/1" target="_blank" rel="noopener noreferrer">DevForum Release</a>
-                <a class="pill-link" href="https://github.com/dqlistic/Discord-Webhook-Proxy" target="_blank" rel="noopener noreferrer" aria-label="GitHub repository">
-                    <span class="github-cat" aria-hidden="true">
+                <a class="pill-link" href="https://github.com/dqlistic/Discord-Webhook-Proxy" target="_blank" rel="noopener noreferrer" aria-label="GitHub Repository">
+                    <span class="github-mark" aria-hidden="true">
                         <svg viewBox="0 0 24 24" fill="currentColor">
                             <path d="M12 2.25c-5.52 0-10 4.48-10 10 0 4.42 2.86 8.16 6.84 9.49.5.09.68-.22.68-.48 0-.23-.01-.86-.01-1.69-2.78.6-3.37-1.19-3.37-1.19-.45-1.15-1.11-1.46-1.11-1.46-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.52 2.34 1.08 2.91.83.09-.65.35-1.08.63-1.33-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02A9.52 9.52 0 0 1 12 7.22c.85 0 1.7.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.01 10.01 0 0 0 22 12.25c0-5.52-4.48-10-10-10Z"/>
-                            <path class="paw" d="M17.3 4.25c.72-.28 1.55-.24 2.17.18.34.24.41.72.17 1.06-.23.33-.7.42-1.04.2-.22-.15-.57-.16-.84-.06-.38.14-.82-.05-.97-.44-.14-.38.05-.81.51-.94Z"/>
                         </svg>
                     </span>
                     GitHub
@@ -659,63 +743,69 @@ INDEX_HTML_TEMPLATE = """
 
         <section class="hero">
             <div class="hero-copy">
-                <span class="eyebrow"><span class="pulse"></span> Live edge proxy</span>
-                <h1><span class="gradient-text">Self-Healing Discord Webhook Delivery.</span></h1>
-                <p>Paste a Discord webhook, compile it into a proxy endpoint, and let the service absorb bursts with a durable Redis queue, adaptive backoff, and replica-safe workers.</p>
+                <span class="eyebrow"><span class="status-dot"></span> Service Online</span>
+                <h1><span class="gradient-text">A Friendly Relay For Busy Discord Webhooks.</span></h1>
+                <p>Paste your Discord webhook, create a proxy endpoint, and let the service smooth out busy moments with a safe queue, respectful retries, and replica-aware delivery.</p>
                 <div class="hero-badges">
-                    <span class="mini-badge">Redis-backed FIFO</span>
-                    <span class="mini-badge">Discord-aware 429 handling</span>
-                    <span class="mini-badge">Adaptive abuse blocks</span>
-                    <span class="mini-badge">Railway replica-ready</span>
+                    <span class="mini-badge">Queue-Safe Delivery</span>
+                    <span class="mini-badge">Discord Rate-Limit Friendly</span>
+                    <span class="mini-badge">Replica-Ready Workers</span>
+                    <span class="mini-badge">Simple Drop-In URL</span>
                 </div>
             </div>
 
-            <section class="terminal" aria-label="Webhook compiler">
-                <div class="terminal-bar">
-                    <div class="lights">
+            <section class="panel" aria-label="Webhook Proxy Converter">
+                <div class="panel-bar">
+                    <div class="lights" aria-hidden="true">
                         <span class="light red"></span>
                         <span class="light yellow"></span>
                         <span class="light green"></span>
                     </div>
-                    <span class="terminal-title">proxy.compiler</span>
+                    <span class="panel-title">proxy.converter</span>
                     <span></span>
                 </div>
+
                 <div class="compiler">
-                    <h2>Compile your endpoint</h2>
-                    <p class="compiler-subtitle">Your original token is kept in the generated URL. Never share it with people who should not post to that channel.</p>
-
-                    <div class="field">
-                        <label for="webhook-input">Original Discord webhook URL</label>
-                        <div class="input-wrap">
-                            <span class="prompt">&gt;</span>
-                            <input id="webhook-input" type="text" placeholder="https://discord.com/api/webhooks/..." autocomplete="off" spellcheck="false">
-                        </div>
-                        <span id="error-msg" class="error">Invalid Discord domain or webhook path.</span>
+                    <div class="compiler-header">
+                        <h2>Create Your Proxy Endpoint</h2>
+                        <p class="compiler-subtitle">Your webhook token stays inside the generated URL, so treat the proxy endpoint like the original webhook and only share it with trusted systems.</p>
                     </div>
 
-                    <button id="compile-btn" class="button" type="button">Compile Proxy Endpoint</button>
+                    <div class="form-stack">
+                        <div class="field">
+                            <label for="webhook-input">Original Discord Webhook URL</label>
+                            <div class="input-wrap">
+                                <span class="prompt">&gt;</span>
+                                <input id="webhook-input" type="text" placeholder="https://discord.com/api/webhooks/..." autocomplete="off" spellcheck="false" inputmode="url">
+                            </div>
+                            <span id="error-msg" class="error">Please enter a Discord webhook URL that starts with /api/webhooks/.</span>
+                        </div>
 
-                    <div class="field" style="margin-top:18px">
-                        <label for="webhook-output">Proxy endpoint</label>
-                        <div class="input-wrap">
-                            <span class="prompt">~</span>
-                            <input id="webhook-output" type="text" readonly placeholder="Awaiting compilation...">
-                            <button id="copy-btn" class="copy-button" type="button">Copy</button>
+                        <button id="compile-btn" class="button" type="button">Create Proxy Endpoint</button>
+
+                        <div class="field">
+                            <label for="webhook-output">Proxy Endpoint</label>
+                            <div class="input-wrap">
+                                <span class="prompt">~</span>
+                                <input id="webhook-output" class="output-input" type="text" readonly placeholder="Your proxy endpoint will appear here.">
+                                <button id="copy-btn" class="copy-button" type="button">Copy</button>
+                            </div>
+                            <span class="helper">Use this proxy URL anywhere you would normally use the original Discord webhook URL.</span>
                         </div>
                     </div>
 
-                    <div class="stats-grid" aria-label="Live service counters">
+                    <div class="stats-grid" aria-label="Service Counters">
                         <div class="stat-card">
                             <strong id="unique-webhooks">0</strong>
-                            <span>unique webhooks protected</span>
+                            <span>Unique Webhooks Protected</span>
                         </div>
                         <div class="stat-card">
                             <strong id="requests-served">0</strong>
-                            <span>requests accepted by the edge</span>
+                            <span>Requests Accepted By The Proxy</span>
                         </div>
                         <div class="stat-card">
                             <strong id="sent-count">0</strong>
-                            <span>dispatches sent to Discord</span>
+                            <span>Messages Sent To Discord</span>
                         </div>
                     </div>
                 </div>
@@ -724,104 +814,98 @@ INDEX_HTML_TEMPLATE = """
 
         <section class="section" id="information">
             <div class="section-header">
-                <div>
-                    <h2>Built for noisy, real-world traffic.</h2>
-                    <p>Short bursts get queued, abusive loops get slowed, and every replica coordinates through Redis so workers do not fight each other.</p>
-                </div>
+                <h2>Made To Keep Busy Moments Smooth.</h2>
+                <p>The proxy accepts webhook requests quickly, queues them safely, and sends them to Discord at a respectful pace so short bursts do not turn into failed deliveries.</p>
             </div>
             <div class="cards">
                 <article class="info-card">
-                    <div class="icon">⏱</div>
-                    <h3>Rate-limit aware</h3>
-                    <p>Reads Discord retry headers and backs off instead of hard-coding fragile limits.</p>
+                    <div class="icon">🌊</div>
+                    <h3>Smooths Out Bursts</h3>
+                    <p>Sudden traffic is placed into Redis-backed queues instead of being dropped immediately.</p>
                 </article>
                 <article class="info-card">
-                    <div class="icon">🧵</div>
-                    <h3>Per-webhook FIFO</h3>
-                    <p>Each webhook gets an ordered queue so bursts stay predictable and isolated.</p>
+                    <div class="icon">🧭</div>
+                    <h3>Keeps Webhooks Ordered</h3>
+                    <p>Each webhook has its own first-in, first-out queue for predictable delivery.</p>
                 </article>
                 <article class="info-card">
-                    <div class="icon">🛡</div>
-                    <h3>Adaptive abuse shield</h3>
-                    <p>Repeated over-limit traffic is temporarily ignored for up to one hour.</p>
+                    <div class="icon">⏳</div>
+                    <h3>Waits When Discord Asks</h3>
+                    <p>Discord retry headers are respected so the service slows down when needed.</p>
                 </article>
                 <article class="info-card">
-                    <div class="icon">🔁</div>
-                    <h3>Self-healing workers</h3>
-                    <p>Timed-out claims are reclaimed so crashed replicas do not strand jobs.</p>
+                    <div class="icon">🛟</div>
+                    <h3>Recovers Lost Work</h3>
+                    <p>If a replica stops mid-dispatch, another worker can reclaim the job safely.</p>
                 </article>
                 <article class="info-card">
-                    <div class="icon">🚄</div>
-                    <h3>Replica-safe Railway</h3>
-                    <p>Atomic Redis scripts coordinate locks, claims, stats, and queue state.</p>
+                    <div class="icon">🧱</div>
+                    <h3>Blocks Abusive Loops</h3>
+                    <p>Repeated over-limit requests can be paused temporarily before they hurt the service.</p>
                 </article>
                 <article class="info-card">
-                    <div class="icon">🚫</div>
-                    <h3>Blacklists</h3>
-                    <p>Optional webhook and IP/CIDR blocklists stop known bad actors early.</p>
+                    <div class="icon">🧪</div>
+                    <h3>Checks Payloads Early</h3>
+                    <p>Empty, oversized, malformed, and conflicting requests are rejected before dispatch.</p>
                 </article>
                 <article class="info-card">
-                    <div class="icon">📦</div>
-                    <h3>Payload guardrails</h3>
-                    <p>Oversized, empty, malformed, or conflicting requests are rejected before dispatch.</p>
+                    <div class="icon">🌍</div>
+                    <h3>Works Across Regions</h3>
+                    <p>Replicas coordinate through Redis so multiple regions can share one delivery pipeline.</p>
                 </article>
                 <article class="info-card">
-                    <div class="icon">📟</div>
-                    <h3>Clean logs</h3>
-                    <p>Structured, readable events make warnings and failures easy to trace.</p>
+                    <div class="icon">📈</div>
+                    <h3>Shows Helpful Counters</h3>
+                    <p>Simple live counters help users see that the proxy is active and processing work.</p>
                 </article>
             </div>
         </section>
 
         <section class="section" id="privacy">
             <div class="section-header">
-                <div>
-                    <h2>Data Handling</h2>
-                    <p>Transparent storage and processing boundaries for everyone using the public proxy.</p>
-                </div>
+                <h2>Clear Data Handling.</h2>
+                <p>The proxy stores only what it needs to queue, retry, protect, and count webhook delivery.</p>
             </div>
             <div class="privacy-grid">
                 <article class="privacy-card">
                     <h3>Stored Permanently</h3>
-                    <p>Aggregate counters, capped diagnostic events, and irreversible webhook fingerprints used for the unique webhook counter.</p>
+                    <p>Aggregate counters, capped diagnostic events, and irreversible webhook fingerprints for the unique webhook counter.</p>
                 </article>
                 <article class="privacy-card">
                     <h3>Stored Temporarily</h3>
-                    <p>Queued payloads, webhook tokens, source IPs, idempotency records, and retry metadata until dispatch or TTL expiry.</p>
+                    <p>Queued payloads, webhook tokens, source IPs, idempotency records, and retry metadata until delivery or expiry.</p>
                 </article>
                 <article class="privacy-card">
-                    <h3>Processed in Transit</h3>
-                    <p>Request body, content type, query string, webhook ID/token, Discord responses, and rate-limit headers.</p>
+                    <h3>Processed In Transit</h3>
+                    <p>Request bodies, content types, query strings, webhook IDs, Discord responses, and rate-limit headers.</p>
                 </article>
             </div>
         </section>
 
         <section class="section" id="rules">
             <div class="section-header">
-                <div>
-                    <h2>Rules & Regulations</h2>
-                    <p>Use the proxy like any other shared infrastructure: respectful, lawful, and compatible with Discord’s platform expectations.</p>
-                </div>
+                <h2>Simple Use Guidelines.</h2>
+                <p>Use the proxy kindly and responsibly so it stays reliable for everyone.</p>
             </div>
             <div class="rules-grid">
                 <article class="rule-card">
-                    <h3>No Spamming or Flooding</h3>
-                    <p>Do not intentionally overload webhooks, Discord, Railway, Redis, or this proxy.</p>
+                    <h3>No Spamming Or Flooding</h3>
+                    <p>Do not intentionally overload Discord, Railway, Redis, this proxy, or any webhook.</p>
                 </article>
                 <article class="rule-card">
-                    <h3>Use Your Own Webhooks</h3>
-                    <p>Only utilise Discord or proxy webhook URLs you created or are explicitly authorized to use.</p>
+                    <h3>Use Webhooks You Own</h3>
+                    <p>Only use Discord or proxy webhook URLs you created or are explicitly allowed to use.</p>
                 </article>
                 <article class="rule-card">
-                    <h3>Respect Platform Terms</h3>
+                    <h3>Respect Platform Rules</h3>
                     <p>No abuse, harassment, illegal content, credential leakage, or evasive automation.</p>
                 </article>
             </div>
         </section>
 
         <footer class="footer">
-            <span>Proxy status: <strong style="color:var(--green)">Online</strong></span>
-            <span class="credit">Architect: <strong>Yee Sen</strong><span>Discord: <strong style="color:var(--blurple)">@yeetysenny</strong></span></span>
+            <span>Proxy Status: <strong class="online">Online</strong></span>
+            <span class="credit">Architect: <strong>Yee Sen</strong><span>Discord: <strong>@yeetysenny</strong></span></span>
         </footer>
     </main>
 
@@ -840,10 +924,10 @@ INDEX_HTML_TEMPLATE = """
         function convertWebhook() {
             try {
                 const original = new URL(input.value.trim());
-                if (!isDiscordHostname(original.hostname)) {
+                if (original.protocol !== "https:" || !isDiscordHostname(original.hostname)) {
                     throw new Error("Invalid host");
                 }
-                if (!/^\\/api\\/webhooks\\/\\d+\\/[A-Za-z0-9_-]+$/.test(original.pathname)) {
+                if (!/^\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+$/.test(original.pathname)) {
                     throw new Error("Invalid path");
                 }
 
@@ -1010,11 +1094,13 @@ local function decrement_pending()
     end
 end
 
+local queue_removed = 0
 local head = redis.call('LINDEX', queue_key, 0)
 if head == job_id then
     redis.call('LPOP', queue_key)
+    queue_removed = 1
 else
-    redis.call('LREM', queue_key, 1, job_id)
+    queue_removed = redis.call('LREM', queue_key, 1, job_id)
 end
 
 redis.call('ZREM', processing_key, job_id)
@@ -1027,6 +1113,8 @@ end
 if delete_job == '1' then
     if redis.call('EXISTS', job_key) == 1 then
         redis.call('DEL', job_key)
+        decrement_pending()
+    elseif queue_removed > 0 then
         decrement_pending()
     end
 end
@@ -1164,6 +1252,102 @@ end
 return {0, window_ttl, 0, count, limit}
 """
 
+ENQUEUE_JOB_LUA = """
+local job_key = KEYS[1]
+local queue_key = KEYS[2]
+local ready_key = KEYS[3]
+local pending_key = KEYS[4]
+local unique_key = KEYS[5]
+local stats_key = KEYS[6]
+local idem_key = KEYS[7]
+
+local job_id = ARGV[1]
+local request_id = ARGV[2]
+local webhook_id = ARGV[3]
+local webhook_token = ARGV[4]
+local webhook_key = ARGV[5]
+local query_string = ARGV[6]
+local body_b64 = ARGV[7]
+local content_type = ARGV[8]
+local source_ip = ARGV[9]
+local created_at_ms = ARGV[10]
+local body_sha256 = ARGV[11]
+local idempotency_value = ARGV[12]
+local job_ttl = tonumber(ARGV[13])
+local idempotency_ttl = tonumber(ARGV[14])
+
+if idempotency_value ~= '' then
+    local existing = redis.call('HGETALL', idem_key)
+    if #existing > 0 then
+        local existing_body_sha256 = ''
+        local existing_request_id = ''
+        local existing_job_id = ''
+        for index = 1, #existing, 2 do
+            if existing[index] == 'body_sha256' then
+                existing_body_sha256 = existing[index + 1]
+            elseif existing[index] == 'request_id' then
+                existing_request_id = existing[index + 1]
+            elseif existing[index] == 'job_id' then
+                existing_job_id = existing[index + 1]
+            end
+        end
+        if existing_body_sha256 ~= '' and existing_body_sha256 ~= body_sha256 then
+            return {'conflict', existing_request_id, existing_job_id, '0'}
+        end
+        redis.call('HINCRBY', stats_key, 'duplicates', 1)
+        redis.call('SADD', unique_key, webhook_key)
+        return {'duplicate', existing_request_id, existing_job_id, '0'}
+    end
+end
+
+redis.call(
+    'HSET',
+    job_key,
+    'job_id', job_id,
+    'request_id', request_id,
+    'webhook_id', webhook_id,
+    'webhook_token', webhook_token,
+    'webhook_key', webhook_key,
+    'query_string', query_string,
+    'body_b64', body_b64,
+    'content_type', content_type,
+    'source_ip', source_ip,
+    'created_at_ms', created_at_ms,
+    'available_at_ms', created_at_ms,
+    'attempts', '0',
+    'last_error', '',
+    'last_status', '',
+    'body_sha256', body_sha256,
+    'idempotency_key', idempotency_value
+)
+redis.call('EXPIRE', job_key, job_ttl)
+
+local queue_length = redis.call('RPUSH', queue_key, job_id)
+redis.call('EXPIRE', queue_key, job_ttl)
+redis.call('INCR', pending_key)
+redis.call('SADD', unique_key, webhook_key)
+
+if queue_length == 1 then
+    redis.call('ZADD', ready_key, tonumber(created_at_ms), webhook_key)
+end
+
+if idempotency_value ~= '' then
+    redis.call(
+        'HSET',
+        idem_key,
+        'job_id', job_id,
+        'request_id', request_id,
+        'body_sha256', body_sha256,
+        'created_at_ms', created_at_ms
+    )
+    redis.call('EXPIRE', idem_key, idempotency_ttl)
+end
+
+redis.call('HINCRBY', stats_key, 'accepted', 1)
+
+return {'accepted', request_id, job_id, tostring(queue_length)}
+"""
+
 def parse_bool(value: str, default: bool = False) -> bool:
     if value == "":
         return default
@@ -1242,8 +1426,15 @@ class Config:
         self.queue_scan_limit = max(1, get_int_env("QUEUE_SCAN_LIMIT", 64))
         self.poll_interval_seconds = max(0.05, get_float_env("QUEUE_POLL_INTERVAL_SECONDS", 0.25))
         self.reclaim_interval_seconds = max(1.0, get_float_env("RECLAIM_INTERVAL_SECONDS", 10.0))
-        self.claim_visibility_seconds = max(30.0, get_float_env("CLAIM_VISIBILITY_SECONDS", 120.0))
         self.http_timeout_seconds = max(5.0, get_float_env("HTTP_TIMEOUT_SECONDS", 20.0))
+        self.claim_visibility_seconds = max(
+            self.http_timeout_seconds + 10.0,
+            get_float_env("CLAIM_VISIBILITY_SECONDS", 120.0),
+        )
+        self.redis_health_check_interval_seconds = max(5, get_int_env("REDIS_HEALTH_CHECK_INTERVAL_SECONDS", 15))
+        self.redis_socket_connect_timeout_seconds = max(1.0, get_float_env("REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", 5.0))
+        self.redis_socket_timeout_seconds = max(2.0, get_float_env("REDIS_SOCKET_TIMEOUT_SECONDS", 30.0))
+        self.trust_proxy_headers = parse_bool(os.getenv("TRUST_PROXY_HEADERS", "true"), True)
         self.max_attempts = max(1, get_int_env("MAX_ATTEMPTS", 8))
         self.base_retry_seconds = max(0.25, get_float_env("BASE_RETRY_SECONDS", 1.5))
         self.max_retry_seconds = max(self.base_retry_seconds, get_float_env("MAX_RETRY_SECONDS", 90.0))
@@ -1360,15 +1551,28 @@ def decode_body(body_b64: str) -> bytes:
     return base64.b64decode(body_b64.encode("ascii"))
 
 
-def extract_client_ip(request: Request) -> str:
+def extract_client_ip(request: Request, trust_proxy_headers: bool) -> str:
+    if trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for", "").strip()
+        if forwarded:
+            forwarded_ip = forwarded.split(",", 1)[0].strip()
+            try:
+                ipaddress.ip_address(forwarded_ip)
+                return forwarded_ip
+            except ValueError:
+                pass
+
+        x_real_ip = request.headers.get("x-real-ip", "").strip()
+        if x_real_ip:
+            try:
+                ipaddress.ip_address(x_real_ip)
+                return x_real_ip
+            except ValueError:
+                pass
+
     if request.client and request.client.host:
         return request.client.host
-    x_real_ip = request.headers.get("x-real-ip", "").strip()
-    if x_real_ip:
-        return x_real_ip
-    forwarded = request.headers.get("x-forwarded-for", "").strip()
-    if forwarded:
-        return forwarded.split(",", 1)[0].strip()
+
     return "unknown"
 
 
@@ -1454,7 +1658,16 @@ class AppState:
         self.config = config
         self.logger = logger
         self.instance_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-        self.redis = redis.from_url(config.redis_url, encoding="utf-8", decode_responses=True, health_check_interval=30)
+        self.redis = redis.from_url(
+            config.redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            health_check_interval=config.redis_health_check_interval_seconds,
+            socket_connect_timeout=config.redis_socket_connect_timeout_seconds,
+            socket_timeout=config.redis_socket_timeout_seconds,
+            socket_keepalive=True,
+            retry_on_timeout=True,
+        )
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(config.http_timeout_seconds, connect=5.0),
             limits=httpx.Limits(
@@ -1684,90 +1897,49 @@ class AppState:
         created_at_ms = now_ms()
         webhook_key_value = webhook_key(webhook_id, webhook_token)
         body_sha256 = sha256_bytes(body)
-        job_record = {
-            "job_id": job_id,
-            "request_id": request_id,
-            "webhook_id": webhook_id,
-            "webhook_token": webhook_token,
-            "webhook_key": webhook_key_value,
-            "query_string": query_string,
-            "body_b64": encode_body(body),
-            "content_type": content_type,
-            "source_ip": source_ip,
-            "created_at_ms": str(created_at_ms),
-            "available_at_ms": str(created_at_ms),
-            "attempts": "0",
-            "last_error": "",
-            "last_status": "",
-            "body_sha256": body_sha256,
-            "idempotency_key": idempotency_key_value or "",
+        idem_key_name = self.idempotency_key(webhook_key_value, idempotency_key_value) if idempotency_key_value else ""
+
+        result = await self.redis.eval(
+            ENQUEUE_JOB_LUA,
+            7,
+            self.job_key(job_id),
+            self.webhook_queue_key(webhook_key_value),
+            self.ready_webhooks_key,
+            self.pending_jobs_key,
+            self.unique_webhooks_key,
+            self.stats_key,
+            idem_key_name,
+            job_id,
+            request_id,
+            webhook_id,
+            webhook_token,
+            webhook_key_value,
+            query_string,
+            encode_body(body),
+            content_type,
+            source_ip,
+            str(created_at_ms),
+            body_sha256,
+            idempotency_key_value or "",
+            str(self.config.job_ttl_seconds),
+            str(self.config.idempotency_ttl_seconds),
+        )
+
+        result_status = str(result[0])
+        result_request_id = str(result[1])
+        result_job_id = str(result[2])
+
+        if result_status == "conflict":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Conflicting payload for the same idempotency key.",
+            )
+
+        return {
+            "request_id": result_request_id,
+            "duplicate": result_status == "duplicate",
+            "job_id": result_job_id,
         }
-        job_key_name = self.job_key(job_id)
-        webhook_queue_key_name = self.webhook_queue_key(webhook_key_value)
-
-        if not idempotency_key_value:
-            async with self.redis.pipeline(transaction=True) as pipe:
-                pipe.hset(job_key_name, mapping=job_record)
-                pipe.expire(job_key_name, self.config.job_ttl_seconds)
-                pipe.rpush(webhook_queue_key_name, job_id)
-                pipe.expire(webhook_queue_key_name, self.config.job_ttl_seconds)
-                pipe.incr(self.pending_jobs_key)
-                pipe.sadd(self.unique_webhooks_key, webhook_key_value)
-                results = await pipe.execute()
-            queue_length = int(results[2])
-            if queue_length == 1:
-                await self.redis.zadd(self.ready_webhooks_key, {webhook_key_value: created_at_ms})
-            await self.increment_stat("accepted")
-            return {"request_id": request_id, "duplicate": False, "job_id": job_id}
-
-        idem_key_name = self.idempotency_key(webhook_key_value, idempotency_key_value)
-
-        while True:
-            try:
-                async with self.redis.pipeline(transaction=True) as pipe:
-                    await pipe.watch(idem_key_name)
-                    existing = await pipe.hgetall(idem_key_name)
-                    if existing:
-                        await pipe.unwatch()
-                        existing_body_hash = existing.get("body_sha256", "")
-                        if existing_body_hash and existing_body_hash != body_sha256:
-                            raise HTTPException(
-                                status_code=status.HTTP_409_CONFLICT,
-                                detail="Conflicting payload for the same idempotency key.",
-                            )
-                        await self.increment_stat("duplicates")
-                        await self.redis.sadd(self.unique_webhooks_key, webhook_key_value)
-                        return {
-                            "request_id": existing.get("request_id", ""),
-                            "duplicate": True,
-                            "job_id": existing.get("job_id", ""),
-                        }
-
-                    pipe.multi()
-                    pipe.hset(job_key_name, mapping=job_record)
-                    pipe.expire(job_key_name, self.config.job_ttl_seconds)
-                    pipe.rpush(webhook_queue_key_name, job_id)
-                    pipe.expire(webhook_queue_key_name, self.config.job_ttl_seconds)
-                    pipe.incr(self.pending_jobs_key)
-                    pipe.sadd(self.unique_webhooks_key, webhook_key_value)
-                    pipe.hset(
-                        idem_key_name,
-                        mapping={
-                            "job_id": job_id,
-                            "request_id": request_id,
-                            "body_sha256": body_sha256,
-                            "created_at_ms": str(created_at_ms),
-                        },
-                    )
-                    pipe.expire(idem_key_name, self.config.idempotency_ttl_seconds)
-                    results = await pipe.execute()
-                queue_length = int(results[2])
-                if queue_length == 1:
-                    await self.redis.zadd(self.ready_webhooks_key, {webhook_key_value: created_at_ms})
-                await self.increment_stat("accepted")
-                return {"request_id": request_id, "duplicate": False, "job_id": job_id}
-            except WatchError:
-                continue
 
     async def push_deadletter(
         self,
@@ -2180,11 +2352,8 @@ async def readyz(request: Request) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@app.get("/api/webhooks/{webhook_id}/{webhook_token}", response_class=RedirectResponse)
-async def redirect_webhook_get(
-    webhook_id: str = FastAPIPath(..., pattern=r"^\d+$"),
-    webhook_token: str = FastAPIPath(..., pattern=r"^[A-Za-z0-9_-]+$"),
-) -> RedirectResponse:
+@app.get("/api/webhooks/{full_path:path}", response_class=RedirectResponse, include_in_schema=False)
+async def redirect_webhook_get(full_path: str) -> RedirectResponse:
     return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
 
@@ -2213,7 +2382,7 @@ async def proxy_webhook(
     webhook_token: str = FastAPIPath(..., pattern=r"^[A-Za-z0-9_-]+$"),
 ) -> JSONResponse:
     state = get_state(request)
-    source_ip = extract_client_ip(request)
+    source_ip = extract_client_ip(request, state.config.trust_proxy_headers)
     query_string = request.url.query
     webhook_key_value = webhook_key(webhook_id, webhook_token)
     webhook_reference = webhook_ref(webhook_id, webhook_token)
@@ -2426,3 +2595,8 @@ async def proxy_webhook(
             "duplicate": enqueue_result["duplicate"],
         },
     )
+
+@app.get("/{full_path:path}", response_class=RedirectResponse, include_in_schema=False)
+async def redirect_unknown_get(full_path: str) -> RedirectResponse:
+    return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
