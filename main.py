@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import hashlib
-import ipaddress
 import json
 import logging
 import os
@@ -12,19 +11,21 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from redis.exceptions import RedisError
 
 WEBHOOK_PATH_RE = re.compile(r"^/api/webhooks/(\d+)/([A-Za-z0-9_-]+)$")
 FAVICON_PATH = Path(__file__).with_name("favicon.png")
 
-INDEX_HTML_TEMPLATE = """
+INDEX_HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -997,11 +998,16 @@ INDEX_HTML_TEMPLATE = """
 </html>
 """
 
+
 CLAIM_NEXT_JOB_LUA = """
 local ready_key = KEYS[1]
 local processing_key = KEYS[2]
-local global_backoff_key = KEYS[3]
-local pending_jobs_key = KEYS[4]
+local processing_meta_key = KEYS[3]
+local global_backoff_key = KEYS[4]
+local global_dispatch_window_key = KEYS[5]
+local pending_jobs_key = KEYS[6]
+local pending_bytes_key = KEYS[7]
+
 local now_ms = tonumber(ARGV[1])
 local scan_limit = tonumber(ARGV[2])
 local consumer = ARGV[3]
@@ -1010,59 +1016,146 @@ local queue_prefix = ARGV[5]
 local job_prefix = ARGV[6]
 local claim_prefix = ARGV[7]
 local lock_prefix = ARGV[8]
+local webhook_lock_prefix = ARGV[9]
+local webhook_backoff_prefix = ARGV[10]
+local webhook_pending_prefix = ARGV[11]
+local webhook_bytes_prefix = ARGV[12]
+local target_bytes_prefix = ARGV[13]
+local cleanup_limit = tonumber(ARGV[14])
+local global_requests_per_second = tonumber(ARGV[15])
+local claim_token = ARGV[16]
+local contention_delay_ms = tonumber(ARGV[17])
+
+local function parse_entry(entry)
+    local first = string.find(entry, '|', 1, true)
+    if not first then
+        return entry, 0, ''
+    end
+    local second = string.find(entry, '|', first + 1, true)
+    if not second then
+        return string.sub(entry, 1, first - 1), tonumber(string.sub(entry, first + 1)) or 0, ''
+    end
+    return string.sub(entry, 1, first - 1), tonumber(string.sub(entry, first + 1, second - 1)) or 0, string.sub(entry, second + 1)
+end
+
+local function decrement_counter(key, amount, delete_when_zero)
+    if amount <= 0 then
+        return
+    end
+    local value = tonumber(redis.call('GET', key) or '0') - amount
+    if value <= 0 then
+        if delete_when_zero == 1 then
+            redis.call('DEL', key)
+        else
+            redis.call('SET', key, '0')
+        end
+    else
+        redis.call('SET', key, tostring(value))
+    end
+end
+
+local function decrement_entry(target_key, entry)
+    local _, charge, webhook_key = parse_entry(entry)
+    decrement_counter(pending_jobs_key, 1, 0)
+    decrement_counter(pending_bytes_key, charge, 0)
+    decrement_counter(target_bytes_prefix .. target_key, charge, 1)
+    if webhook_key ~= '' then
+        decrement_counter(webhook_pending_prefix .. webhook_key, 1, 1)
+        decrement_counter(webhook_bytes_prefix .. webhook_key, charge, 1)
+    end
+end
+
+local function promote_head(target_key)
+    local queue_key = queue_prefix .. target_key
+    local cleaned = 0
+    while cleaned < cleanup_limit do
+        local entry = redis.call('LINDEX', queue_key, 0)
+        if not entry then
+            redis.call('ZREM', ready_key, target_key)
+            redis.call('DEL', queue_key)
+            redis.call('DEL', target_bytes_prefix .. target_key)
+            return nil
+        end
+
+        local job_id, _, entry_webhook_key = parse_entry(entry)
+        local job_key = job_prefix .. job_id
+        if redis.call('EXISTS', job_key) == 1 then
+            local available_at = tonumber(redis.call('HGET', job_key, 'available_at_ms') or '0')
+            local webhook_key = redis.call('HGET', job_key, 'webhook_key') or entry_webhook_key
+            return {job_id, entry, webhook_key, available_at}
+        end
+
+        redis.call('LPOP', queue_key)
+        decrement_entry(target_key, entry)
+        cleaned = cleaned + 1
+    end
+
+    redis.call('ZADD', ready_key, now_ms, target_key)
+    return nil
+end
 
 if redis.call('EXISTS', global_backoff_key) == 1 then
     return {}
 end
 
-local function decrement_pending()
-    local pending = redis.call('DECR', pending_jobs_key)
-    if pending < 0 then
-        redis.call('SET', pending_jobs_key, '0')
-    end
-end
+local due_targets = redis.call('ZRANGEBYSCORE', ready_key, '-inf', now_ms, 'LIMIT', 0, scan_limit)
 
-local function promote_head(webhook_key)
-    local queue_key = queue_prefix .. webhook_key
-    while true do
-        local job_id = redis.call('LINDEX', queue_key, 0)
-        if not job_id then
-            redis.call('ZREM', ready_key, webhook_key)
-            redis.call('DEL', queue_key)
-            return nil
-        end
+for _, target_key in ipairs(due_targets) do
+    local head = promote_head(target_key)
+    if head then
+        local job_id = head[1]
+        local entry = head[2]
+        local webhook_key = head[3]
+        local available_at = tonumber(head[4]) or 0
 
-        local job_key = job_prefix .. job_id
-        if redis.call('EXISTS', job_key) == 0 then
-            redis.call('LPOP', queue_key)
-            decrement_pending()
+        if available_at > now_ms then
+            redis.call('ZADD', ready_key, available_at, target_key)
         else
-            local available_at = redis.call('HGET', job_key, 'available_at_ms')
-            if available_at then
-                redis.call('ZADD', ready_key, tonumber(available_at), webhook_key)
-                return job_id
-            end
-            redis.call('LPOP', queue_key)
-            decrement_pending()
-        end
-    end
-end
+            local webhook_backoff_key = webhook_backoff_prefix .. webhook_key
+            local webhook_backoff_ms = redis.call('PTTL', webhook_backoff_key)
+            if webhook_backoff_ms and webhook_backoff_ms > 0 then
+                redis.call('ZADD', ready_key, now_ms + webhook_backoff_ms, target_key)
+            else
+                local claim_value = job_id .. '|' .. claim_token
+                local lock_key = lock_prefix .. target_key
+                local webhook_lock_key = webhook_lock_prefix .. webhook_key
+                if redis.call('SET', lock_key, claim_value, 'NX', 'PX', visibility_ms) then
+                    if redis.call('SET', webhook_lock_key, claim_value, 'NX', 'PX', visibility_ms) then
+                        local dispatch_allowed = 1
+                        if global_requests_per_second > 0 then
+                            local current = tonumber(redis.call('GET', global_dispatch_window_key) or '0')
+                            local ttl = redis.call('PTTL', global_dispatch_window_key)
+                            if ttl and ttl < 0 then
+                                redis.call('DEL', global_dispatch_window_key)
+                                current = 0
+                                ttl = 0
+                            end
+                            if current >= global_requests_per_second and ttl and ttl > 0 then
+                                dispatch_allowed = 0
+                                redis.call('DEL', lock_key)
+                                redis.call('DEL', webhook_lock_key)
+                                redis.call('ZADD', ready_key, now_ms + ttl, target_key)
+                            else
+                                local count = redis.call('INCR', global_dispatch_window_key)
+                                if count == 1 then
+                                    redis.call('PEXPIRE', global_dispatch_window_key, 1000)
+                                end
+                            end
+                        end
 
-local due_webhooks = redis.call('ZRANGEBYSCORE', ready_key, '-inf', now_ms, 'LIMIT', 0, scan_limit)
-
-for _, webhook_key in ipairs(due_webhooks) do
-    local job_id = promote_head(webhook_key)
-    if job_id then
-        local job_key = job_prefix .. job_id
-        local available_at = tonumber(redis.call('HGET', job_key, 'available_at_ms') or '0')
-        if available_at <= now_ms then
-            local lock_key = lock_prefix .. webhook_key
-            local claim_key = claim_prefix .. job_id
-            if redis.call('SET', lock_key, job_id, 'NX', 'PX', visibility_ms) then
-                redis.call('SET', claim_key, consumer, 'PX', visibility_ms)
-                redis.call('ZADD', processing_key, now_ms + visibility_ms, job_id)
-                redis.call('ZREM', ready_key, webhook_key)
-                return {job_id, webhook_key}
+                        if dispatch_allowed == 1 then
+                            local claim_key = claim_prefix .. job_id
+                            redis.call('SET', claim_key, claim_value, 'PX', visibility_ms)
+                            redis.call('ZADD', processing_key, now_ms + visibility_ms, job_id)
+                            redis.call('HSET', processing_meta_key, job_id, target_key .. '\t' .. entry .. '\t' .. claim_token)
+                            redis.call('ZREM', ready_key, target_key)
+                            return {job_id, target_key, entry, webhook_key, claim_token, consumer}
+                        end
+                    else
+                        redis.call('DEL', lock_key)
+                        redis.call('ZADD', ready_key, now_ms + contention_delay_ms, target_key)
+                    end
+                end
             end
         end
     end
@@ -1074,115 +1167,403 @@ return {}
 FINALIZE_JOB_LUA = """
 local ready_key = KEYS[1]
 local processing_key = KEYS[2]
-local pending_jobs_key = KEYS[3]
-local job_id = ARGV[1]
-local webhook_key = ARGV[2]
-local queue_prefix = ARGV[3]
-local job_prefix = ARGV[4]
-local claim_prefix = ARGV[5]
-local lock_prefix = ARGV[6]
-local delete_job = ARGV[7]
-local queue_key = queue_prefix .. webhook_key
-local job_key = job_prefix .. job_id
-local claim_key = claim_prefix .. job_id
-local lock_key = lock_prefix .. webhook_key
+local processing_meta_key = KEYS[3]
+local pending_jobs_key = KEYS[4]
+local pending_bytes_key = KEYS[5]
+local job_key = KEYS[6]
+local queue_key = KEYS[7]
+local claim_key = KEYS[8]
+local lock_key = KEYS[9]
+local webhook_pending_key = KEYS[10]
+local webhook_bytes_key = KEYS[11]
+local target_bytes_key = KEYS[12]
+local webhook_lock_key = KEYS[13]
 
-local function decrement_pending()
-    local pending = redis.call('DECR', pending_jobs_key)
-    if pending < 0 then
-        redis.call('SET', pending_jobs_key, '0')
+local job_id = ARGV[1]
+local target_key = ARGV[2]
+local queue_entry = ARGV[3]
+local webhook_key = ARGV[4]
+local claim_token = ARGV[5]
+local delete_job = ARGV[6]
+local job_prefix = ARGV[7]
+local queue_prefix = ARGV[8]
+local claim_prefix = ARGV[9]
+local lock_prefix = ARGV[10]
+local webhook_pending_prefix = ARGV[11]
+local webhook_bytes_prefix = ARGV[12]
+local target_bytes_prefix = ARGV[13]
+local cleanup_limit = tonumber(ARGV[14])
+local now_ms = tonumber(ARGV[15])
+
+local function parse_entry(entry)
+    local first = string.find(entry, '|', 1, true)
+    if not first then
+        return entry, 0, ''
+    end
+    local second = string.find(entry, '|', first + 1, true)
+    if not second then
+        return string.sub(entry, 1, first - 1), tonumber(string.sub(entry, first + 1)) or 0, ''
+    end
+    return string.sub(entry, 1, first - 1), tonumber(string.sub(entry, first + 1, second - 1)) or 0, string.sub(entry, second + 1)
+end
+
+local function meta_token(value)
+    if not value then
+        return ''
+    end
+    local last = nil
+    local start = 1
+    while true do
+        local pos = string.find(value, '\t', start, true)
+        if not pos then
+            return string.sub(value, start)
+        end
+        last = pos
+        start = pos + 1
     end
 end
 
-local queue_removed = 0
-local head = redis.call('LINDEX', queue_key, 0)
-if head == job_id then
-    redis.call('LPOP', queue_key)
-    queue_removed = 1
-else
+local function decrement_counter(key, amount, delete_when_zero)
+    if amount <= 0 then
+        return
+    end
+    local value = tonumber(redis.call('GET', key) or '0') - amount
+    if value <= 0 then
+        if delete_when_zero == 1 then
+            redis.call('DEL', key)
+        else
+            redis.call('SET', key, '0')
+        end
+    else
+        redis.call('SET', key, tostring(value))
+    end
+end
+
+local function decrement_entry(entry_target_key, entry)
+    local _, charge, entry_webhook_key = parse_entry(entry)
+    decrement_counter(pending_jobs_key, 1, 0)
+    decrement_counter(pending_bytes_key, charge, 0)
+    decrement_counter(target_bytes_prefix .. entry_target_key, charge, 1)
+    if entry_webhook_key ~= '' then
+        decrement_counter(webhook_pending_prefix .. entry_webhook_key, 1, 1)
+        decrement_counter(webhook_bytes_prefix .. entry_webhook_key, charge, 1)
+    end
+end
+
+local current_meta = redis.call('HGET', processing_meta_key, job_id)
+if current_meta and meta_token(current_meta) ~= claim_token then
+    return {'stale'}
+end
+
+local was_processing = redis.call('ZSCORE', processing_key, job_id)
+local queue_removed = redis.call('LREM', queue_key, 1, queue_entry)
+if queue_removed == 0 and queue_entry ~= job_id then
     queue_removed = redis.call('LREM', queue_key, 1, job_id)
 end
 
-redis.call('ZREM', processing_key, job_id)
-redis.call('DEL', claim_key)
+local _, charge, entry_webhook_key = parse_entry(queue_entry)
+if charge <= 0 then
+    charge = tonumber(redis.call('HGET', job_key, 'storage_bytes') or '0')
+end
+if webhook_key == '' then
+    webhook_key = redis.call('HGET', job_key, 'webhook_key') or entry_webhook_key
+end
 
-if redis.call('GET', lock_key) == job_id then
+redis.call('ZREM', processing_key, job_id)
+redis.call('HDEL', processing_meta_key, job_id)
+
+local claim_value = job_id .. '|' .. claim_token
+if redis.call('GET', claim_key) == claim_value then
+    redis.call('DEL', claim_key)
+end
+if redis.call('GET', lock_key) == claim_value or redis.call('GET', lock_key) == job_id then
     redis.call('DEL', lock_key)
+end
+if redis.call('GET', webhook_lock_key) == claim_value or redis.call('GET', webhook_lock_key) == job_id then
+    redis.call('DEL', webhook_lock_key)
 end
 
 if delete_job == '1' then
-    if redis.call('EXISTS', job_key) == 1 then
-        redis.call('DEL', job_key)
-        decrement_pending()
-    elseif queue_removed > 0 then
-        decrement_pending()
+    redis.call('DEL', job_key)
+end
+
+if queue_removed > 0 or was_processing then
+    decrement_counter(pending_jobs_key, 1, 0)
+    decrement_counter(pending_bytes_key, charge, 0)
+    decrement_counter(target_bytes_key, charge, 1)
+    if webhook_key ~= '' then
+        decrement_counter(webhook_pending_key, 1, 1)
+        decrement_counter(webhook_bytes_key, charge, 1)
     end
 end
 
-while true do
-    local next_job_id = redis.call('LINDEX', queue_key, 0)
-    if not next_job_id then
-        redis.call('ZREM', ready_key, webhook_key)
+local cleaned = 0
+while cleaned < cleanup_limit do
+    local next_entry = redis.call('LINDEX', queue_key, 0)
+    if not next_entry then
+        redis.call('ZREM', ready_key, target_key)
         redis.call('DEL', queue_key)
-        return ''
+        redis.call('DEL', target_bytes_key)
+        return {'finalized'}
     end
 
+    local next_job_id = parse_entry(next_entry)
     local next_job_key = job_prefix .. next_job_id
-    if redis.call('EXISTS', next_job_key) == 0 then
-        redis.call('LPOP', queue_key)
-        decrement_pending()
-    else
-        local next_available_at = redis.call('HGET', next_job_key, 'available_at_ms')
-        if next_available_at then
-            redis.call('ZADD', ready_key, tonumber(next_available_at), webhook_key)
-            return next_job_id
+    if redis.call('EXISTS', next_job_key) == 1 then
+        local next_available_at = tonumber(redis.call('HGET', next_job_key, 'available_at_ms') or tostring(now_ms))
+        if next_available_at < now_ms then
+            next_available_at = now_ms
         end
-        redis.call('LPOP', queue_key)
-        decrement_pending()
+        redis.call('ZADD', ready_key, next_available_at, target_key)
+        return {'finalized'}
     end
+
+    redis.call('LPOP', queue_key)
+    decrement_entry(target_key, next_entry)
+    cleaned = cleaned + 1
 end
+
+redis.call('ZADD', ready_key, now_ms, target_key)
+return {'finalized'}
 """
 
 RESCHEDULE_JOB_LUA = """
 local ready_key = KEYS[1]
 local processing_key = KEYS[2]
+local processing_meta_key = KEYS[3]
+local job_key = KEYS[4]
+local claim_key = KEYS[5]
+local lock_key = KEYS[6]
+local webhook_lock_key = KEYS[7]
+
 local job_id = ARGV[1]
-local webhook_key = ARGV[2]
+local target_key = ARGV[2]
 local next_available_at = tonumber(ARGV[3])
 local attempts = ARGV[4]
 local last_error = ARGV[5]
 local last_status = ARGV[6]
 local job_ttl = tonumber(ARGV[7])
-local queue_prefix = ARGV[8]
-local job_prefix = ARGV[9]
-local claim_prefix = ARGV[10]
-local lock_prefix = ARGV[11]
-local job_key = job_prefix .. job_id
-local claim_key = claim_prefix .. job_id
-local lock_key = lock_prefix .. webhook_key
+local claim_token = ARGV[8]
 
-if redis.call('EXISTS', job_key) == 1 then
-    redis.call('HSET', job_key, 'attempts', attempts, 'available_at_ms', tostring(next_available_at), 'last_error', last_error, 'last_status', last_status)
-    redis.call('EXPIRE', job_key, job_ttl)
+local meta = redis.call('HGET', processing_meta_key, job_id)
+if meta then
+    local last_tab = nil
+    local start = 1
+    while true do
+        local pos = string.find(meta, '\t', start, true)
+        if not pos then
+            local token = string.sub(meta, start)
+            if token ~= claim_token then
+                return {'stale'}
+            end
+            break
+        end
+        last_tab = pos
+        start = pos + 1
+    end
 end
 
-redis.call('ZREM', processing_key, job_id)
-redis.call('DEL', claim_key)
+if redis.call('EXISTS', job_key) == 0 then
+    return {'missing'}
+end
 
-if redis.call('GET', lock_key) == job_id then
+redis.call('HSET', job_key, 'attempts', attempts, 'available_at_ms', tostring(next_available_at), 'last_error', last_error, 'last_status', last_status)
+redis.call('EXPIRE', job_key, job_ttl)
+redis.call('ZREM', processing_key, job_id)
+redis.call('HDEL', processing_meta_key, job_id)
+
+local claim_value = job_id .. '|' .. claim_token
+if redis.call('GET', claim_key) == claim_value then
+    redis.call('DEL', claim_key)
+end
+if redis.call('GET', lock_key) == claim_value or redis.call('GET', lock_key) == job_id then
     redis.call('DEL', lock_key)
 end
+if redis.call('GET', webhook_lock_key) == claim_value or redis.call('GET', webhook_lock_key) == job_id then
+    redis.call('DEL', webhook_lock_key)
+end
 
-redis.call('ZADD', ready_key, next_available_at, webhook_key)
-redis.call('EXPIRE', queue_prefix .. webhook_key, job_ttl)
+redis.call('ZADD', ready_key, next_available_at, target_key)
+return {'rescheduled'}
+"""
 
-return 1
+RECLAIM_JOB_LUA = """
+local ready_key = KEYS[1]
+local processing_key = KEYS[2]
+local processing_meta_key = KEYS[3]
+local pending_jobs_key = KEYS[4]
+local pending_bytes_key = KEYS[5]
+local job_key = KEYS[6]
+local claim_key = KEYS[7]
+
+local job_id = ARGV[1]
+local now_ms = tonumber(ARGV[2])
+local job_ttl = tonumber(ARGV[3])
+local queue_prefix = ARGV[4]
+local job_prefix = ARGV[5]
+local lock_prefix = ARGV[6]
+local webhook_pending_prefix = ARGV[7]
+local webhook_bytes_prefix = ARGV[8]
+local target_bytes_prefix = ARGV[9]
+local webhook_lock_prefix = ARGV[10]
+local cleanup_limit = tonumber(ARGV[11])
+
+local function parse_entry(entry)
+    local first = string.find(entry, '|', 1, true)
+    if not first then
+        return entry, 0, ''
+    end
+    local second = string.find(entry, '|', first + 1, true)
+    if not second then
+        return string.sub(entry, 1, first - 1), tonumber(string.sub(entry, first + 1)) or 0, ''
+    end
+    return string.sub(entry, 1, first - 1), tonumber(string.sub(entry, first + 1, second - 1)) or 0, string.sub(entry, second + 1)
+end
+
+local function decrement_counter(key, amount, delete_when_zero)
+    if amount <= 0 then
+        return
+    end
+    local value = tonumber(redis.call('GET', key) or '0') - amount
+    if value <= 0 then
+        if delete_when_zero == 1 then
+            redis.call('DEL', key)
+        else
+            redis.call('SET', key, '0')
+        end
+    else
+        redis.call('SET', key, tostring(value))
+    end
+end
+
+local function decrement_entry(target_key, entry)
+    local _, charge, webhook_key = parse_entry(entry)
+    decrement_counter(pending_jobs_key, 1, 0)
+    decrement_counter(pending_bytes_key, charge, 0)
+    decrement_counter(target_bytes_prefix .. target_key, charge, 1)
+    if webhook_key ~= '' then
+        decrement_counter(webhook_pending_prefix .. webhook_key, 1, 1)
+        decrement_counter(webhook_bytes_prefix .. webhook_key, charge, 1)
+    end
+end
+
+local score = redis.call('ZSCORE', processing_key, job_id)
+if not score then
+    return {'gone'}
+end
+if tonumber(score) > now_ms then
+    return {'not_due'}
+end
+
+local claim_ttl = redis.call('PTTL', claim_key)
+if claim_ttl and claim_ttl > 0 then
+    redis.call('ZADD', processing_key, now_ms + claim_ttl, job_id)
+    return {'active'}
+end
+
+local meta = redis.call('HGET', processing_meta_key, job_id) or ''
+local first_tab = string.find(meta, '\t', 1, true)
+local last_tab = nil
+local target_key = ''
+local queue_entry = ''
+local claim_token = ''
+
+if first_tab then
+    target_key = string.sub(meta, 1, first_tab - 1)
+    local second_tab = string.find(meta, '\t', first_tab + 1, true)
+    if second_tab then
+        queue_entry = string.sub(meta, first_tab + 1, second_tab - 1)
+        claim_token = string.sub(meta, second_tab + 1)
+    end
+end
+
+if target_key == '' then
+    target_key = redis.call('HGET', job_key, 'target_key') or redis.call('HGET', job_key, 'webhook_key') or ''
+end
+if queue_entry == '' then
+    queue_entry = redis.call('HGET', job_key, 'queue_entry') or job_id
+end
+
+if target_key == '' then
+    redis.call('ZREM', processing_key, job_id)
+    redis.call('HDEL', processing_meta_key, job_id)
+    redis.call('DEL', claim_key)
+    return {'orphaned'}
+end
+
+local _, _, entry_webhook_key = parse_entry(queue_entry)
+local webhook_key = redis.call('HGET', job_key, 'webhook_key') or entry_webhook_key
+local queue_key = queue_prefix .. target_key
+local lock_key = lock_prefix .. target_key
+local webhook_lock_key = webhook_lock_prefix .. webhook_key
+local claim_value = job_id .. '|' .. claim_token
+
+if redis.call('EXISTS', job_key) == 1 then
+    redis.call('HSET', job_key, 'available_at_ms', tostring(now_ms), 'last_error', 'reclaimed_after_visibility_timeout')
+    redis.call('EXPIRE', job_key, job_ttl)
+    if redis.call('GET', lock_key) == claim_value or redis.call('GET', lock_key) == job_id then
+        redis.call('DEL', lock_key)
+    end
+    if webhook_key ~= '' and (redis.call('GET', webhook_lock_key) == claim_value or redis.call('GET', webhook_lock_key) == job_id) then
+        redis.call('DEL', webhook_lock_key)
+    end
+    redis.call('ZREM', processing_key, job_id)
+    redis.call('HDEL', processing_meta_key, job_id)
+    redis.call('DEL', claim_key)
+    redis.call('ZADD', ready_key, now_ms, target_key)
+    return {'reclaimed'}
+end
+
+local removed = redis.call('LREM', queue_key, 1, queue_entry)
+if removed == 0 and queue_entry ~= job_id then
+    removed = redis.call('LREM', queue_key, 1, job_id)
+end
+if removed > 0 then
+    decrement_entry(target_key, queue_entry)
+end
+
+if redis.call('GET', lock_key) == claim_value or redis.call('GET', lock_key) == job_id then
+    redis.call('DEL', lock_key)
+end
+if webhook_key ~= '' and (redis.call('GET', webhook_lock_key) == claim_value or redis.call('GET', webhook_lock_key) == job_id) then
+    redis.call('DEL', webhook_lock_key)
+end
+redis.call('ZREM', processing_key, job_id)
+redis.call('HDEL', processing_meta_key, job_id)
+redis.call('DEL', claim_key)
+
+local cleaned = 0
+while cleaned < cleanup_limit do
+    local next_entry = redis.call('LINDEX', queue_key, 0)
+    if not next_entry then
+        redis.call('ZREM', ready_key, target_key)
+        redis.call('DEL', queue_key)
+        redis.call('DEL', target_bytes_prefix .. target_key)
+        return {'missing_cleaned'}
+    end
+    local next_job_id = parse_entry(next_entry)
+    if redis.call('EXISTS', job_prefix .. next_job_id) == 1 then
+        local available_at = tonumber(redis.call('HGET', job_prefix .. next_job_id, 'available_at_ms') or tostring(now_ms))
+        if available_at < now_ms then
+            available_at = now_ms
+        end
+        redis.call('ZADD', ready_key, available_at, target_key)
+        return {'missing_cleaned'}
+    end
+    redis.call('LPOP', queue_key)
+    decrement_entry(target_key, next_entry)
+    cleaned = cleaned + 1
+end
+
+redis.call('ZADD', ready_key, now_ms, target_key)
+return {'missing_cleaned'}
 """
 
 RATE_LIMIT_LUA = """
 local window_key = KEYS[1]
 local violations_key = KEYS[2]
 local block_key = KEYS[3]
+local global_window_key = KEYS[4]
 local limit = tonumber(ARGV[1])
 local window_seconds = tonumber(ARGV[2])
 local violation_ttl = tonumber(ARGV[3])
@@ -1190,6 +1571,21 @@ local block_after = tonumber(ARGV[4])
 local base_block_seconds = tonumber(ARGV[5])
 local max_block_seconds = tonumber(ARGV[6])
 local burst_multiplier = tonumber(ARGV[7])
+local global_limit = tonumber(ARGV[8])
+local global_window_seconds = tonumber(ARGV[9])
+
+local global_count = redis.call('INCR', global_window_key)
+if global_count == 1 then
+    redis.call('EXPIRE', global_window_key, global_window_seconds)
+end
+if global_count > global_limit then
+    local global_ttl = redis.call('TTL', global_window_key)
+    if not global_ttl or global_ttl < 1 then
+        global_ttl = global_window_seconds
+        redis.call('EXPIRE', global_window_key, global_window_seconds)
+    end
+    return {0, global_ttl, 0, global_count, global_limit}
+end
 
 local block_ttl = redis.call('TTL', block_key)
 if block_ttl and block_ttl > 0 then
@@ -1212,11 +1608,7 @@ if not window_ttl or window_ttl < 1 then
 end
 
 local violations = redis.call('INCR', violations_key)
-if violations == 1 then
-    redis.call('EXPIRE', violations_key, violation_ttl)
-else
-    redis.call('EXPIRE', violations_key, violation_ttl)
-end
+redis.call('EXPIRE', violations_key, violation_ttl)
 
 local should_block = 0
 if violations >= block_after then
@@ -1256,49 +1648,130 @@ ENQUEUE_JOB_LUA = """
 local job_key = KEYS[1]
 local queue_key = KEYS[2]
 local ready_key = KEYS[3]
-local pending_key = KEYS[4]
-local unique_key = KEYS[5]
-local stats_key = KEYS[6]
-local idem_key = KEYS[7]
+local pending_jobs_key = KEYS[4]
+local pending_bytes_key = KEYS[5]
+local webhook_pending_key = KEYS[6]
+local webhook_bytes_key = KEYS[7]
+local target_bytes_key = KEYS[8]
+local unique_hll_key = KEYS[9]
+local stats_key = KEYS[10]
+local idem_key = KEYS[11]
+local idem_index_key = KEYS[12]
 
 local job_id = ARGV[1]
 local request_id = ARGV[2]
 local webhook_id = ARGV[3]
 local webhook_token = ARGV[4]
 local webhook_key = ARGV[5]
-local query_string = ARGV[6]
-local body_b64 = ARGV[7]
-local content_type = ARGV[8]
-local source_ip = ARGV[9]
-local created_at_ms = ARGV[10]
-local body_sha256 = ARGV[11]
-local idempotency_value = ARGV[12]
-local job_ttl = tonumber(ARGV[13])
-local idempotency_ttl = tonumber(ARGV[14])
+local target_key = ARGV[6]
+local target_context = ARGV[7]
+local query_string = ARGV[8]
+local body_b64 = ARGV[9]
+local content_type = ARGV[10]
+local created_at_ms = ARGV[11]
+local body_sha256 = ARGV[12]
+local request_sha256 = ARGV[13]
+local idempotency_value = ARGV[14]
+local job_ttl = tonumber(ARGV[15])
+local idempotency_ttl = tonumber(ARGV[16])
+local storage_bytes = tonumber(ARGV[17])
+local priority = ARGV[18]
+local target_limit = tonumber(ARGV[19])
+local webhook_limit = tonumber(ARGV[20])
+local global_limit = tonumber(ARGV[21])
+local target_bytes_limit = tonumber(ARGV[22])
+local webhook_bytes_limit = tonumber(ARGV[23])
+local global_bytes_limit = tonumber(ARGV[24])
+local absolute_limit = tonumber(ARGV[25])
+local absolute_bytes_limit = tonumber(ARGV[26])
+local idempotency_max_entries = tonumber(ARGV[27])
+local idempotency_cleanup_limit = tonumber(ARGV[28])
 
 if idempotency_value ~= '' then
-    local existing = redis.call('HGETALL', idem_key)
-    if #existing > 0 then
-        local existing_body_sha256 = ''
-        local existing_request_id = ''
-        local existing_job_id = ''
-        for index = 1, #existing, 2 do
-            if existing[index] == 'body_sha256' then
-                existing_body_sha256 = existing[index + 1]
-            elseif existing[index] == 'request_id' then
-                existing_request_id = existing[index + 1]
-            elseif existing[index] == 'job_id' then
-                existing_job_id = existing[index + 1]
+    local expired_idempotency_keys = redis.call(
+        'ZRANGEBYSCORE',
+        idem_index_key,
+        '-inf',
+        tonumber(created_at_ms),
+        'LIMIT',
+        0,
+        idempotency_cleanup_limit
+    )
+    for _, expired_idempotency_key in ipairs(expired_idempotency_keys) do
+        redis.call('ZREM', idem_index_key, expired_idempotency_key)
+        redis.call('DEL', expired_idempotency_key)
+    end
+    local existing_request_sha256 = redis.call('HGET', idem_key, 'request_sha256') or ''
+    local existing_body_sha256 = redis.call('HGET', idem_key, 'body_sha256') or ''
+    if existing_request_sha256 ~= '' or existing_body_sha256 ~= '' then
+        local existing_request_id = redis.call('HGET', idem_key, 'request_id') or ''
+        local existing_job_id = redis.call('HGET', idem_key, 'job_id') or ''
+        if existing_request_sha256 ~= '' then
+            if existing_request_sha256 ~= request_sha256 then
+                return {'conflict', existing_request_id, existing_job_id, '0', '0'}
             end
-        end
-        if existing_body_sha256 ~= '' and existing_body_sha256 ~= body_sha256 then
-            return {'conflict', existing_request_id, existing_job_id, '0'}
+        elseif existing_body_sha256 ~= body_sha256 then
+            return {'conflict', existing_request_id, existing_job_id, '0', '0'}
         end
         redis.call('HINCRBY', stats_key, 'duplicates', 1)
-        redis.call('SADD', unique_key, webhook_key)
-        return {'duplicate', existing_request_id, existing_job_id, '0'}
+        redis.call('PFADD', unique_hll_key, webhook_key)
+        return {'duplicate', existing_request_id, existing_job_id, '0', '0'}
+    end
+
+    local idempotency_count = redis.call('ZCARD', idem_index_key)
+    if idempotency_count >= idempotency_max_entries then
+        local overflow = idempotency_count - idempotency_max_entries + 1
+        local remove_count = overflow
+        if remove_count > idempotency_cleanup_limit then
+            remove_count = idempotency_cleanup_limit
+        end
+        local oldest_idempotency_keys = redis.call('ZRANGE', idem_index_key, 0, remove_count - 1)
+        for _, oldest_idempotency_key in ipairs(oldest_idempotency_keys) do
+            redis.call('ZREM', idem_index_key, oldest_idempotency_key)
+            redis.call('DEL', oldest_idempotency_key)
+        end
+        if redis.call('ZCARD', idem_index_key) >= idempotency_max_entries then
+            return {'global_idempotency_overloaded', request_id, job_id, '0', '0'}
+        end
     end
 end
+
+local queue_length = redis.call('LLEN', queue_key)
+local pending_jobs = tonumber(redis.call('GET', pending_jobs_key) or '0')
+local pending_bytes = tonumber(redis.call('GET', pending_bytes_key) or '0')
+local webhook_pending = tonumber(redis.call('GET', webhook_pending_key) or '0')
+local webhook_bytes = tonumber(redis.call('GET', webhook_bytes_key) or '0')
+local target_bytes = tonumber(redis.call('GET', target_bytes_key) or '0')
+
+if absolute_limit > 0 and pending_jobs + 1 > absolute_limit then
+    return {'absolute_count_overloaded', request_id, job_id, tostring(queue_length), tostring(pending_jobs)}
+end
+if absolute_bytes_limit > 0 and pending_bytes + storage_bytes > absolute_bytes_limit then
+    return {'absolute_bytes_overloaded', request_id, job_id, tostring(queue_length), tostring(pending_jobs)}
+end
+
+if priority ~= '1' then
+    if target_limit > 0 and queue_length + 1 > target_limit then
+        return {'target_count_overloaded', request_id, job_id, tostring(queue_length), tostring(pending_jobs)}
+    end
+    if webhook_limit > 0 and webhook_pending + 1 > webhook_limit then
+        return {'webhook_count_overloaded', request_id, job_id, tostring(queue_length), tostring(pending_jobs)}
+    end
+    if global_limit > 0 and pending_jobs + 1 > global_limit then
+        return {'global_count_overloaded', request_id, job_id, tostring(queue_length), tostring(pending_jobs)}
+    end
+    if target_bytes_limit > 0 and target_bytes + storage_bytes > target_bytes_limit then
+        return {'target_bytes_overloaded', request_id, job_id, tostring(queue_length), tostring(pending_jobs)}
+    end
+    if webhook_bytes_limit > 0 and webhook_bytes + storage_bytes > webhook_bytes_limit then
+        return {'webhook_bytes_overloaded', request_id, job_id, tostring(queue_length), tostring(pending_jobs)}
+    end
+    if global_bytes_limit > 0 and pending_bytes + storage_bytes > global_bytes_limit then
+        return {'global_bytes_overloaded', request_id, job_id, tostring(queue_length), tostring(pending_jobs)}
+    end
+end
+
+local queue_entry = job_id .. '|' .. tostring(storage_bytes) .. '|' .. webhook_key
 
 redis.call(
     'HSET',
@@ -1308,27 +1781,35 @@ redis.call(
     'webhook_id', webhook_id,
     'webhook_token', webhook_token,
     'webhook_key', webhook_key,
+    'target_key', target_key,
+    'target_context', target_context,
+    'queue_entry', queue_entry,
     'query_string', query_string,
     'body_b64', body_b64,
     'content_type', content_type,
-    'source_ip', source_ip,
     'created_at_ms', created_at_ms,
     'available_at_ms', created_at_ms,
     'attempts', '0',
     'last_error', '',
     'last_status', '',
     'body_sha256', body_sha256,
-    'idempotency_key', idempotency_value
+    'request_sha256', request_sha256,
+    'storage_bytes', tostring(storage_bytes),
+    'priority', priority
 )
 redis.call('EXPIRE', job_key, job_ttl)
 
-local queue_length = redis.call('RPUSH', queue_key, job_id)
-redis.call('EXPIRE', queue_key, job_ttl)
-redis.call('INCR', pending_key)
-redis.call('SADD', unique_key, webhook_key)
+queue_length = redis.call('RPUSH', queue_key, queue_entry)
+redis.call('PERSIST', queue_key)
+redis.call('INCR', pending_jobs_key)
+redis.call('INCRBY', pending_bytes_key, storage_bytes)
+redis.call('INCR', webhook_pending_key)
+redis.call('INCRBY', webhook_bytes_key, storage_bytes)
+redis.call('INCRBY', target_bytes_key, storage_bytes)
+redis.call('PFADD', unique_hll_key, webhook_key)
 
 if queue_length == 1 then
-    redis.call('ZADD', ready_key, tonumber(created_at_ms), webhook_key)
+    redis.call('ZADD', ready_key, tonumber(created_at_ms), target_key)
 end
 
 if idempotency_value ~= '' then
@@ -1338,15 +1819,152 @@ if idempotency_value ~= '' then
         'job_id', job_id,
         'request_id', request_id,
         'body_sha256', body_sha256,
+        'request_sha256', request_sha256,
         'created_at_ms', created_at_ms
     )
     redis.call('EXPIRE', idem_key, idempotency_ttl)
+    redis.call('ZADD', idem_index_key, tonumber(created_at_ms) + (idempotency_ttl * 1000), idem_key)
 end
 
 redis.call('HINCRBY', stats_key, 'accepted', 1)
 
-return {'accepted', request_id, job_id, tostring(queue_length)}
+return {'accepted', request_id, job_id, tostring(queue_length), tostring(pending_jobs + 1)}
 """
+
+SET_MAX_BACKOFF_LUA = """
+local key = KEYS[1]
+local ttl_ms = tonumber(ARGV[1])
+local current = redis.call('PTTL', key)
+if not current or current < ttl_ms then
+    redis.call('PSETEX', key, ttl_ms, '1')
+    return ttl_ms
+end
+return current
+"""
+
+RECORD_INVALID_REQUEST_LUA = """
+local window_key = KEYS[1]
+local global_backoff_key = KEYS[2]
+local stats_key = KEYS[3]
+
+local request_limit = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+
+local count = redis.call('INCR', window_key)
+if count == 1 then
+    redis.call('PEXPIRE', window_key, window_ms)
+end
+local ttl_ms = redis.call('PTTL', window_key)
+if not ttl_ms or ttl_ms < 1 then
+    ttl_ms = window_ms
+    redis.call('PEXPIRE', window_key, window_ms)
+end
+redis.call('HINCRBY', stats_key, 'invalid_requests', 1)
+
+if count >= request_limit then
+    local current_backoff = redis.call('PTTL', global_backoff_key)
+    if not current_backoff or current_backoff < ttl_ms then
+        redis.call('PSETEX', global_backoff_key, ttl_ms, '1')
+    end
+    return {count, ttl_ms, 1}
+end
+
+return {count, ttl_ms, 0}
+"""
+
+PUSH_DEADLETTER_LUA = """
+local index_key = KEYS[1]
+local deadletter_key = KEYS[2]
+local stats_key = KEYS[3]
+local bytes_key = KEYS[4]
+
+local ttl_seconds = tonumber(ARGV[1])
+local max_entries = tonumber(ARGV[2])
+local now_ms = tonumber(ARGV[3])
+local deadletter_prefix = ARGV[4]
+local cleanup_limit = tonumber(ARGV[5])
+local field_count = tonumber(ARGV[6])
+local job_id = ARGV[7]
+local storage_bytes = tonumber(ARGV[8])
+local max_bytes = tonumber(ARGV[9])
+
+local function decrement_bytes(amount)
+    local value = tonumber(redis.call('GET', bytes_key) or '0') - amount
+    if value <= 0 then
+        redis.call('SET', bytes_key, '0')
+    else
+        redis.call('SET', bytes_key, tostring(value))
+    end
+end
+
+local function delete_deadletter(entry_job_id)
+    local entry_key = deadletter_prefix .. entry_job_id
+    local charge = tonumber(redis.call('HGET', entry_key, 'storage_bytes') or '0')
+    redis.call('ZREM', index_key, entry_job_id)
+    redis.call('DEL', entry_key)
+    if charge > 0 then
+        decrement_bytes(charge)
+    end
+end
+
+local expired = redis.call('ZRANGEBYSCORE', index_key, '-inf', now_ms, 'LIMIT', 0, cleanup_limit)
+for _, expired_job_id in ipairs(expired) do
+    delete_deadletter(expired_job_id)
+end
+
+if redis.call('EXISTS', deadletter_key) == 1 then
+    delete_deadletter(job_id)
+end
+
+local evicted = 0
+while evicted < cleanup_limit do
+    local cardinality = redis.call('ZCARD', index_key)
+    local current_bytes = tonumber(redis.call('GET', bytes_key) or '0')
+    if cardinality < max_entries and current_bytes + storage_bytes <= max_bytes then
+        break
+    end
+    local oldest = redis.call('ZRANGE', index_key, 0, 0)
+    if not oldest[1] then
+        if cardinality == 0 then
+            redis.call('SET', bytes_key, '0')
+        end
+        break
+    end
+    delete_deadletter(oldest[1])
+    evicted = evicted + 1
+end
+
+local cardinality = redis.call('ZCARD', index_key)
+local current_bytes = tonumber(redis.call('GET', bytes_key) or '0')
+if storage_bytes > max_bytes or cardinality >= max_entries or current_bytes + storage_bytes > max_bytes then
+    redis.call('HINCRBY', stats_key, 'deadletter_dropped', 1)
+    return 0
+end
+
+local args = {}
+local offset = 10
+for index = 1, field_count * 2 do
+    args[index] = ARGV[offset + index - 1]
+end
+redis.call('HSET', deadletter_key, unpack(args))
+redis.call('EXPIRE', deadletter_key, ttl_seconds)
+redis.call('ZADD', index_key, now_ms + (ttl_seconds * 1000), job_id)
+redis.call('INCRBY', bytes_key, storage_bytes)
+redis.call('HINCRBY', stats_key, 'deadletter', 1)
+return 1
+"""
+
+
+def env_value(name: str, default: str = "", legacy_names: tuple[str, ...] = ()) -> str:
+    value = os.getenv(name)
+    if value is not None:
+        return value
+    for legacy_name in legacy_names:
+        legacy_value = os.getenv(legacy_name)
+        if legacy_value is not None:
+            return legacy_value
+    return default
+
 
 def parse_bool(value: str, default: bool = False) -> bool:
     if value == "":
@@ -1354,18 +1972,31 @@ def parse_bool(value: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def get_int_env(name: str, default: int) -> int:
+def get_int_env(name: str, default: int, legacy_names: tuple[str, ...] = ()) -> int:
     try:
-        return int(os.getenv(name, str(default)))
+        return int(env_value(name, str(default), legacy_names))
     except ValueError:
         return default
 
 
-def get_float_env(name: str, default: float) -> float:
+def get_float_env(name: str, default: float, legacy_names: tuple[str, ...] = ()) -> float:
     try:
-        return float(os.getenv(name, str(default)))
+        return float(env_value(name, str(default), legacy_names))
     except ValueError:
         return default
+
+
+def get_csv_float_env(name: str, default: tuple[float, ...], legacy_names: tuple[str, ...] = ()) -> tuple[float, ...]:
+    raw = env_value(name, ",".join(str(value) for value in default), legacy_names)
+    values: list[float] = []
+    for item in raw.split(","):
+        try:
+            parsed = float(item.strip())
+        except ValueError:
+            continue
+        if parsed >= 0:
+            values.append(parsed)
+    return tuple(values) or default
 
 
 def csv_items(raw: str) -> list[str]:
@@ -1398,96 +2029,85 @@ def parse_blacklisted_webhooks(raw: str) -> tuple[set[str], list[str]]:
     return blocked, invalid
 
 
-def parse_ip_networks(raw: str) -> tuple[list[ipaddress._BaseNetwork], list[str]]:
-    networks: list[ipaddress._BaseNetwork] = []
-    invalid: list[str] = []
-    for item in csv_items(raw):
-        try:
-            networks.append(ipaddress.ip_network(item, strict=False))
-        except ValueError:
-            invalid.append(item)
-    return networks, invalid
-
-
-def ip_in_networks(ip_value: str, networks: list[ipaddress._BaseNetwork]) -> bool:
-    try:
-        ip = ipaddress.ip_address(ip_value)
-    except ValueError:
-        return False
-    return any(ip in network for network in networks)
-
-
 class Config:
     def __init__(self) -> None:
-        self.redis_url = os.getenv("REDIS_URL", "").strip()
-        self.port = max(1, get_int_env("PORT", 8000))
-        self.queue_prefix = os.getenv("QUEUE_PREFIX", "discord_proxy").strip() or "discord_proxy"
-        self.dispatch_concurrency = max(1, get_int_env("DISPATCH_CONCURRENCY", 8))
-        self.queue_scan_limit = max(1, get_int_env("QUEUE_SCAN_LIMIT", 64))
-        self.poll_interval_seconds = max(0.05, get_float_env("QUEUE_POLL_INTERVAL_SECONDS", 0.25))
-        self.reclaim_interval_seconds = max(1.0, get_float_env("RECLAIM_INTERVAL_SECONDS", 10.0))
-        self.http_timeout_seconds = max(5.0, get_float_env("HTTP_TIMEOUT_SECONDS", 20.0))
+        self.redis_url = env_value("RedisUrl", "", ("REDIS_URL",)).strip()
+        self.api_key = env_value("ApiKey", "", ("API_KEY",)).strip()
+        self.port = max(1, get_int_env("Port", 8000, ("PORT",)))
+        self.queue_prefix = env_value("QueuePrefix", "discord_proxy", ("QUEUE_PREFIX",)).strip() or "discord_proxy"
+        self.dispatch_concurrency = max(1, get_int_env("DispatchConcurrency", 8, ("DISPATCH_CONCURRENCY",)))
+        self.queue_scan_limit = max(1, get_int_env("QueueScanLimit", 64, ("QUEUE_SCAN_LIMIT",)))
+        self.stale_cleanup_limit = max(1, min(256, get_int_env("StaleCleanupLimit", 16, ("STALE_CLEANUP_LIMIT",))))
+        self.poll_interval_seconds = max(0.05, get_float_env("QueuePollIntervalSeconds", 0.25, ("QUEUE_POLL_INTERVAL_SECONDS",)))
+        self.reclaim_interval_seconds = max(1.0, get_float_env("ReclaimIntervalSeconds", 10.0, ("RECLAIM_INTERVAL_SECONDS",)))
+        self.http_timeout_seconds = max(5.0, get_float_env("HttpTimeoutSeconds", 20.0, ("HTTP_TIMEOUT_SECONDS",)))
         self.claim_visibility_seconds = max(
-            self.http_timeout_seconds + 10.0,
-            get_float_env("CLAIM_VISIBILITY_SECONDS", 120.0),
+            self.http_timeout_seconds + 30.0,
+            get_float_env("ClaimVisibilitySeconds", 120.0, ("CLAIM_VISIBILITY_SECONDS",)),
         )
-        self.redis_health_check_interval_seconds = max(5, get_int_env("REDIS_HEALTH_CHECK_INTERVAL_SECONDS", 15))
-        self.redis_socket_connect_timeout_seconds = max(1.0, get_float_env("REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", 5.0))
-        self.redis_socket_timeout_seconds = max(2.0, get_float_env("REDIS_SOCKET_TIMEOUT_SECONDS", 30.0))
-        self.trust_proxy_headers = parse_bool(os.getenv("TRUST_PROXY_HEADERS", "true"), True)
-        self.max_attempts = max(1, get_int_env("MAX_ATTEMPTS", 8))
-        self.base_retry_seconds = max(0.25, get_float_env("BASE_RETRY_SECONDS", 1.5))
-        self.max_retry_seconds = max(self.base_retry_seconds, get_float_env("MAX_RETRY_SECONDS", 90.0))
-        self.job_ttl_seconds = max(300, get_int_env("JOB_TTL_SECONDS", 172800))
-        self.idempotency_ttl_seconds = max(60, get_int_env("IDEMPOTENCY_TTL_SECONDS", 86400))
-        self.max_body_bytes = max(1024, get_int_env("MAX_BODY_BYTES", 32 * 1024 * 1024))
-        self.max_query_length = max(256, get_int_env("MAX_QUERY_LENGTH", 8192))
-        self.max_idempotency_key_length = max(16, get_int_env("MAX_IDEMPOTENCY_KEY_LENGTH", 128))
-        self.max_content_type_length = max(32, get_int_env("MAX_CONTENT_TYPE_LENGTH", 200))
-        self.deadletter_maxlen = max(100, get_int_env("DEADLETTER_MAXLEN", 10000))
-        self.http_max_keepalive_connections = max(10, get_int_env("HTTP_MAX_KEEPALIVE_CONNECTIONS", 200))
-        self.http_max_connections = max(self.http_max_keepalive_connections, get_int_env("HTTP_MAX_CONNECTIONS", 400))
-        self.webhook_rate_limit_requests = max(1, get_int_env("WEBHOOK_RATE_LIMIT_REQUESTS", 60))
-        self.webhook_rate_limit_window_seconds = max(1, get_int_env("WEBHOOK_RATE_LIMIT_WINDOW_SECONDS", 60))
-        self.webhook_abuse_block_after = max(1, get_int_env("WEBHOOK_ABUSE_BLOCK_AFTER", 3))
-        self.webhook_abuse_base_block_seconds = max(1, get_int_env("WEBHOOK_ABUSE_BASE_BLOCK_SECONDS", 30))
-        self.webhook_abuse_max_block_seconds = min(3600, max(self.webhook_abuse_base_block_seconds, get_int_env("WEBHOOK_ABUSE_MAX_BLOCK_SECONDS", 3600)))
-        self.webhook_abuse_burst_multiplier = max(1.0, get_float_env("WEBHOOK_ABUSE_BURST_MULTIPLIER", 2.0))
-        self.ip_rate_limit_enabled = parse_bool(os.getenv("ENABLE_IP_RATE_LIMIT", "false"))
-        self.ip_rate_limit_requests = max(1, get_int_env("IP_RATE_LIMIT_REQUESTS", 240))
-        self.ip_rate_limit_window_seconds = max(1, get_int_env("IP_RATE_LIMIT_WINDOW_SECONDS", 60))
-        self.ip_abuse_block_after = max(1, get_int_env("IP_ABUSE_BLOCK_AFTER", 5))
-        self.ip_abuse_base_block_seconds = max(1, get_int_env("IP_ABUSE_BASE_BLOCK_SECONDS", 30))
-        self.ip_abuse_max_block_seconds = min(3600, max(self.ip_abuse_base_block_seconds, get_int_env("IP_ABUSE_MAX_BLOCK_SECONDS", 3600)))
-        self.ip_abuse_burst_multiplier = max(1.0, get_float_env("IP_ABUSE_BURST_MULTIPLIER", 3.0))
-        self.rate_limit_violation_ttl_seconds = max(60, get_int_env("RATE_LIMIT_VIOLATION_TTL_SECONDS", 3600))
-        webhook_blacklist_raw = os.getenv("BlacklistedWebhooks", os.getenv("BLACKLISTED_WEBHOOKS", ""))
-        ip_blacklist_raw = os.getenv("BlacklistedIPs", os.getenv("BLACKLISTED_IPS", ""))
+        self.redis_health_check_interval_seconds = max(5, get_int_env("RedisHealthCheckIntervalSeconds", 15, ("REDIS_HEALTH_CHECK_INTERVAL_SECONDS",)))
+        self.redis_socket_connect_timeout_seconds = max(1.0, get_float_env("RedisSocketConnectTimeoutSeconds", 5.0, ("REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS",)))
+        self.redis_socket_timeout_seconds = max(2.0, get_float_env("RedisSocketTimeoutSeconds", 30.0, ("REDIS_SOCKET_TIMEOUT_SECONDS",)))
+        self.max_retries = max(0, get_int_env("MaxRetries", 4, ("MAX_RETRIES", "MAX_ATTEMPTS")))
+        self.retry_backoff_multiplier = max(1.0, get_float_env("RetryBackoffMultiplier", 2.0, ("RETRY_BACKOFF_MULTIPLIER",)))
+        self.retry_schedule_seconds = get_csv_float_env("RetryScheduleSeconds", (1.0, 5.0, 30.0, 300.0), ("RETRY_SCHEDULE_SECONDS",))
+        self.max_retry_delay_seconds = max(1.0, get_float_env("MaxRetryDelaySeconds", 300.0, ("MAX_RETRY_DELAY_SECONDS", "MAX_RETRY_SECONDS")))
+        self.job_ttl_seconds = max(600, get_int_env("JobTtlSeconds", 604800, ("JOB_TTL_SECONDS",)))
+        self.idempotency_ttl_seconds = max(60, get_int_env("IdempotencyTtlSeconds", 86400, ("IDEMPOTENCY_TTL_SECONDS",)))
+        self.idempotency_max_entries = max(1, get_int_env("IdempotencyMaxEntries", 100000, ("IDEMPOTENCY_MAX_ENTRIES",)))
+        self.idempotency_cleanup_limit = max(1, min(1000, get_int_env("IdempotencyCleanupLimit", 100, ("IDEMPOTENCY_CLEANUP_LIMIT",))))
+        self.deadletter_ttl_seconds = max(60, get_int_env("DeadletterTtlSeconds", 604800, ("DEADLETTER_TTL_SECONDS",)))
+        self.deadletter_max_entries = max(1, get_int_env("DeadletterMaxEntries", 10000, ("DEADLETTER_MAX_ENTRIES", "DEADLETTER_MAXLEN")))
+        self.deadletter_payload_max_bytes = max(0, get_int_env("DeadletterPayloadMaxBytes", 262144, ("DEADLETTER_PAYLOAD_MAX_BYTES",)))
+        self.deadletter_bytes_limit = max(1048576, get_int_env("DeadletterBytesLimit", 134217728, ("DEADLETTER_BYTES_LIMIT",)))
+        self.max_body_bytes = max(1024, get_int_env("MaxBodyBytes", 32 * 1024 * 1024, ("MAX_BODY_BYTES",)))
+        self.storage_overhead_bytes = max(1024, get_int_env("StorageOverheadBytes", 2048, ("STORAGE_OVERHEAD_BYTES",)))
+        self.max_query_length = max(256, get_int_env("MaxQueryLength", 8192, ("MAX_QUERY_LENGTH",)))
+        self.max_query_fields = max(1, get_int_env("MaxQueryFields", 64, ("MAX_QUERY_FIELDS",)))
+        self.max_idempotency_key_length = max(16, get_int_env("MaxIdempotencyKeyLength", 128, ("MAX_IDEMPOTENCY_KEY_LENGTH",)))
+        self.max_content_type_length = max(32, get_int_env("MaxContentTypeLength", 200, ("MAX_CONTENT_TYPE_LENGTH",)))
+        self.ingress_concurrency = max(1, get_int_env("IngressConcurrency", 64, ("INGRESS_CONCURRENCY",)))
+        self.ingress_wait_seconds = max(0.001, get_float_env("IngressWaitSeconds", 0.05, ("INGRESS_WAIT_SECONDS",)))
+        self.http_max_keepalive_connections = max(10, get_int_env("HttpMaxKeepaliveConnections", 200, ("HTTP_MAX_KEEPALIVE_CONNECTIONS",)))
+        self.http_max_connections = max(self.http_max_keepalive_connections, get_int_env("HttpMaxConnections", 400, ("HTTP_MAX_CONNECTIONS",)))
+        self.target_queue_limit = max(1, get_int_env("TargetQueueLimit", 1000, ("TARGET_QUEUE_LIMIT",)))
+        self.webhook_queue_limit = max(1, get_int_env("WebhookQueueLimit", 1000, ("WEBHOOK_QUEUE_LIMIT",)))
+        self.global_queue_limit = max(1, get_int_env("GlobalQueueLimit", 100000, ("GLOBAL_QUEUE_LIMIT",)))
+        self.absolute_queue_limit = max(self.global_queue_limit, get_int_env("AbsoluteQueueLimit", 120000, ("ABSOLUTE_QUEUE_LIMIT",)))
+        minimum_queue_bytes = (self.max_body_bytes * 4 // 3) + 4096
+        self.target_queue_bytes_limit = max(minimum_queue_bytes, get_int_env("TargetQueueBytesLimit", 128 * 1024 * 1024, ("TARGET_QUEUE_BYTES_LIMIT",)))
+        self.webhook_queue_bytes_limit = max(self.target_queue_bytes_limit, get_int_env("WebhookQueueBytesLimit", 256 * 1024 * 1024, ("WEBHOOK_QUEUE_BYTES_LIMIT",)))
+        self.global_queue_bytes_limit = max(self.webhook_queue_bytes_limit, get_int_env("GlobalQueueBytesLimit", 512 * 1024 * 1024, ("GLOBAL_QUEUE_BYTES_LIMIT",)))
+        self.absolute_queue_bytes_limit = max(self.global_queue_bytes_limit, get_int_env("AbsoluteQueueBytesLimit", 768 * 1024 * 1024, ("ABSOLUTE_QUEUE_BYTES_LIMIT",)))
+        self.overload_retry_after_seconds = max(1, get_int_env("OverloadRetryAfterSeconds", 60, ("OVERLOAD_RETRY_AFTER_SECONDS",)))
+        self.discord_global_requests_per_second = max(1, get_int_env("DiscordGlobalRequestsPerSecond", 45, ("DISCORD_GLOBAL_REQUESTS_PER_SECOND",)))
+        self.discord_invalid_request_limit = max(1, get_int_env("DiscordInvalidRequestLimit", 9000, ("DISCORD_INVALID_REQUEST_LIMIT",)))
+        self.discord_invalid_request_window_seconds = max(60, get_int_env("DiscordInvalidRequestWindowSeconds", 600, ("DISCORD_INVALID_REQUEST_WINDOW_SECONDS",)))
+        self.global_ingress_rate_limit_requests = max(1, get_int_env("GlobalIngressRateLimitRequests", 10000, ("GLOBAL_INGRESS_RATE_LIMIT_REQUESTS",)))
+        self.global_ingress_rate_limit_window_seconds = max(1, get_int_env("GlobalIngressRateLimitWindowSeconds", 60, ("GLOBAL_INGRESS_RATE_LIMIT_WINDOW_SECONDS",)))
+        self.webhook_rate_limit_requests = max(1, get_int_env("WebhookRateLimitRequests", 120, ("WEBHOOK_RATE_LIMIT_REQUESTS",)))
+        self.webhook_rate_limit_window_seconds = max(1, get_int_env("WebhookRateLimitWindowSeconds", 60, ("WEBHOOK_RATE_LIMIT_WINDOW_SECONDS",)))
+        self.webhook_abuse_block_after = max(1, get_int_env("WebhookAbuseBlockAfter", 3, ("WEBHOOK_ABUSE_BLOCK_AFTER",)))
+        self.webhook_abuse_base_block_seconds = max(1, get_int_env("WebhookAbuseBaseBlockSeconds", 30, ("WEBHOOK_ABUSE_BASE_BLOCK_SECONDS",)))
+        self.webhook_abuse_max_block_seconds = min(3600, max(self.webhook_abuse_base_block_seconds, get_int_env("WebhookAbuseMaxBlockSeconds", 3600, ("WEBHOOK_ABUSE_MAX_BLOCK_SECONDS",))))
+        self.webhook_abuse_burst_multiplier = max(1.0, get_float_env("WebhookAbuseBurstMultiplier", 2.0, ("WEBHOOK_ABUSE_BURST_MULTIPLIER",)))
+        self.rate_limit_violation_ttl_seconds = max(60, get_int_env("RateLimitViolationTtlSeconds", 3600, ("RATE_LIMIT_VIOLATION_TTL_SECONDS",)))
+        self.log_level = env_value("LogLevel", "WARNING", ("LOG_LEVEL",)).strip().upper() or "WARNING"
+        webhook_blacklist_raw = env_value("BlacklistedWebhooks", "", ("BLACKLISTED_WEBHOOKS",))
         self.blacklisted_webhook_keys, self.invalid_blacklisted_webhooks = parse_blacklisted_webhooks(webhook_blacklist_raw)
-        self.blacklisted_ip_networks, self.invalid_blacklisted_ips = parse_ip_networks(ip_blacklist_raw)
 
         if not self.redis_url:
-            raise RuntimeError("REDIS_URL is required for durable replica-safe dispatching.")
+            raise RuntimeError("RedisUrl is required for durable replica-safe dispatching.")
 
 
 class PrettyLogFormatter(logging.Formatter):
-    LEVEL_NAMES = {
-        "DEBUG": "Trace",
-        "INFO": "Info",
-        "WARNING": "Warning",
-        "ERROR": "Error",
-        "CRITICAL": "Critical",
-    }
-
     def format(self, record: logging.LogRecord) -> str:
         timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-        level = self.LEVEL_NAMES.get(record.levelname, record.levelname.title())
-        message = record.getMessage()
         details = getattr(record, "details", {}) or {}
         if not isinstance(details, dict):
             details = {"details": details}
         rendered = " ".join(f"{key}={self._stringify(value)}" for key, value in details.items() if value is not None)
-        return f"{timestamp} | {level} | {message}" + (f" | {rendered}" if rendered else "")
+        return f"{timestamp} | {record.levelname.title()} | {record.getMessage()}" + (f" | {rendered}" if rendered else "")
 
     def _stringify(self, value: Any) -> str:
         if isinstance(value, float):
@@ -1498,20 +2118,24 @@ class PrettyLogFormatter(logging.Formatter):
         return text
 
 
-def configure_logging() -> logging.Logger:
+def configure_logging(log_level: str) -> logging.Logger:
     logger = logging.getLogger("discord_proxy")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    handler.setFormatter(PrettyLogFormatter())
-    logger.addHandler(handler)
+    level = getattr(logging, log_level, logging.WARNING)
+    logger.setLevel(level)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(PrettyLogFormatter())
+        logger.addHandler(handler)
     logger.propagate = False
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("redis").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").disabled = True
+    logging.getLogger("httpx").setLevel(logging.CRITICAL)
+    logging.getLogger("httpcore").setLevel(logging.CRITICAL)
+    logging.getLogger("redis").setLevel(logging.CRITICAL)
     return logger
+
+
+def log_event(logger: logging.Logger, level: int, message: str, details: dict[str, Any] | None = None) -> None:
+    logger.log(level, message, extra={"details": details or {}})
 
 
 def now_ms() -> int:
@@ -1538,6 +2162,12 @@ def webhook_ref(webhook_id: str, webhook_token: str) -> str:
     return f"{webhook_id}:{short_hash(webhook_token)}"
 
 
+def target_key(webhook_key_value: str, target_context: str) -> str:
+    if target_context == "webhook":
+        return webhook_key_value
+    return sha256_text(f"{webhook_key_value}:{target_context}")
+
+
 def build_discord_url(webhook_id: str, webhook_token: str, query_string: str) -> str:
     base = f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}"
     return f"{base}?{query_string}" if query_string else base
@@ -1548,32 +2178,7 @@ def encode_body(body: bytes) -> str:
 
 
 def decode_body(body_b64: str) -> bytes:
-    return base64.b64decode(body_b64.encode("ascii"))
-
-
-def extract_client_ip(request: Request, trust_proxy_headers: bool) -> str:
-    if trust_proxy_headers:
-        forwarded = request.headers.get("x-forwarded-for", "").strip()
-        if forwarded:
-            forwarded_ip = forwarded.split(",", 1)[0].strip()
-            try:
-                ipaddress.ip_address(forwarded_ip)
-                return forwarded_ip
-            except ValueError:
-                pass
-
-        x_real_ip = request.headers.get("x-real-ip", "").strip()
-        if x_real_ip:
-            try:
-                ipaddress.ip_address(x_real_ip)
-                return x_real_ip
-            except ValueError:
-                pass
-
-    if request.client and request.client.host:
-        return request.client.host
-
-    return "unknown"
+    return base64.b64decode(body_b64.encode("ascii"), validate=True)
 
 
 def normalize_content_type(content_type: str) -> str:
@@ -1585,27 +2190,60 @@ def looks_like_json(body: bytes) -> bool:
     return stripped.startswith(b"{") or stripped.startswith(b"[")
 
 
-def get_retry_after_seconds(response: httpx.Response) -> float:
-    header_value = response.headers.get("Retry-After")
-    if header_value:
+def parse_retry_after_header(value: str) -> float | None:
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
         try:
-            return max(float(header_value), 0.0)
-        except ValueError:
-            pass
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max((parsed - datetime.now(timezone.utc)).total_seconds(), 0.0)
+
+
+def get_retry_after_seconds(response: httpx.Response) -> float:
     try:
         payload = response.json()
         retry_after = payload.get("retry_after")
         if retry_after is not None:
             return max(float(retry_after), 0.0)
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         pass
+
+    header_value = response.headers.get("Retry-After")
+    if header_value:
+        parsed_header = parse_retry_after_header(header_value)
+        if parsed_header is not None:
+            return parsed_header
+
     reset_after = response.headers.get("X-RateLimit-Reset-After")
     if reset_after:
         try:
             return max(float(reset_after), 0.0)
         except ValueError:
             pass
-    return 1.5
+
+    return 1.0
+
+
+def get_bucket_reset_after_seconds(response: httpx.Response) -> float | None:
+    remaining = response.headers.get("X-RateLimit-Remaining")
+    if remaining is None:
+        return None
+    try:
+        if int(float(remaining)) > 0:
+            return None
+    except ValueError:
+        return None
+    reset_after = response.headers.get("X-RateLimit-Reset-After")
+    if not reset_after:
+        return None
+    try:
+        return max(float(reset_after), 0.0)
+    except ValueError:
+        return None
 
 
 def is_global_rate_limited(response: httpx.Response) -> bool:
@@ -1615,7 +2253,7 @@ def is_global_rate_limited(response: httpx.Response) -> bool:
         return True
     try:
         return bool(response.json().get("global") is True)
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         return False
 
 
@@ -1625,11 +2263,19 @@ def truncate_text(value: str, limit: int = 240) -> str:
     return value[: limit - 1] + "…"
 
 
-def retry_delay_seconds(attempts: int, config: Config) -> float:
-    delay = min(config.base_retry_seconds * (2 ** max(attempts - 1, 0)), config.max_retry_seconds)
-    jitter_seed = (attempts * 9301 + 49297) % 233280
+def retry_delay_seconds(failure_number: int, config: Config, server_retry_after: float | None = None) -> float:
+    index = max(failure_number - 1, 0)
+    if index < len(config.retry_schedule_seconds):
+        delay = config.retry_schedule_seconds[index]
+    else:
+        extra_steps = index - len(config.retry_schedule_seconds) + 1
+        delay = config.retry_schedule_seconds[-1] * (config.retry_backoff_multiplier ** extra_steps)
+    delay = min(delay, config.max_retry_delay_seconds)
+    if server_retry_after is not None:
+        delay = max(delay, server_retry_after)
+    jitter_seed = (failure_number * 9301 + 49297) % 233280
     jitter = (jitter_seed / 233280.0) * 0.25
-    return min(delay + jitter, config.max_retry_seconds)
+    return delay + jitter
 
 
 def integer_dict(values: dict[str, str]) -> dict[str, int]:
@@ -1642,7 +2288,115 @@ def integer_dict(values: dict[str, str]) -> dict[str, int]:
     return converted
 
 
+def validate_content_type(content_type: str, max_length: int) -> str:
+    value = content_type.strip()
+    if len(value) > max_length:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Content-Type header too large.")
+    if any(ord(character) < 32 and character not in {"\t"} for character in value) or "\x7f" in value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Content-Type header.")
+    return value
+
+
+def sanitize_query_string(raw_query: str, config: Config, header_api_key: str | None) -> tuple[str, bool, str | None]:
+    if len(raw_query) > config.max_query_length:
+        raise HTTPException(status_code=status.HTTP_414_REQUEST_URI_TOO_LONG, detail="Query string too large.")
+    try:
+        pairs = parse_qsl(
+            raw_query,
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=config.max_query_fields,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid query string.") from exc
+
+    query_api_keys = [value for key, value in pairs if key == "ApiKey"]
+    if len(query_api_keys) > 1:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ApiKey may be provided only once.")
+
+    supplied_api_key = query_api_keys[0] if query_api_keys else None
+    if supplied_api_key is not None and len(supplied_api_key) > 512:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key.")
+    if header_api_key is not None and len(header_api_key) > 512:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key.")
+    if header_api_key is not None:
+        if supplied_api_key is not None and not secrets.compare_digest(header_api_key, supplied_api_key):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Conflicting API credentials.")
+        supplied_api_key = header_api_key
+
+    priority = False
+    if supplied_api_key is not None:
+        if not config.api_key or not secrets.compare_digest(supplied_api_key, config.api_key):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key.")
+        priority = True
+
+    forwarded_pairs = [(key, value) for key, value in pairs if key != "ApiKey"]
+    thread_values = [value for key, value in forwarded_pairs if key == "thread_id"]
+    if len(thread_values) > 1:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="thread_id may be provided only once.")
+    thread_id = thread_values[0] if thread_values else None
+    if thread_id is not None and (not thread_id.isdigit() or len(thread_id) > 20):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid thread_id.")
+
+    return urlencode(forwarded_pairs, doseq=True), priority, thread_id
+
+
+def derive_target_context(thread_id: str | None, normalized_content_type: str, body: bytes) -> str:
+    if thread_id:
+        return f"thread_id:{thread_id}"
+    if normalized_content_type in {"application/json", "text/json"}:
+        try:
+            payload = json.loads(body)
+        except (ValueError, TypeError):
+            return "webhook"
+        if isinstance(payload, dict):
+            thread_name = payload.get("thread_name")
+            if isinstance(thread_name, str) and thread_name:
+                return f"thread_name:{sha256_text(thread_name)[:24]}"
+    return "webhook"
+
+
+def request_fingerprint(body: bytes, query_string: str, content_type: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(body)
+    digest.update(b"\x00")
+    digest.update(query_string.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(normalize_content_type(content_type).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def estimated_storage_bytes(
+    body_b64: str,
+    query_string: str,
+    content_type: str,
+    webhook_token: str,
+    storage_overhead_bytes: int,
+) -> int:
+    return len(body_b64) + len(query_string) + len(content_type) + len(webhook_token) + storage_overhead_bytes
+
+
+def parse_queue_entry(entry: str, fallback_webhook_key: str = "") -> tuple[str, int, str]:
+    parts = entry.split("|", 2)
+    if len(parts) == 1:
+        return parts[0], 0, fallback_webhook_key
+    try:
+        charge = int(parts[1])
+    except ValueError:
+        charge = 0
+    webhook_key_value = parts[2] if len(parts) == 3 else fallback_webhook_key
+    return parts[0], max(charge, 0), webhook_key_value
+
+
 async def read_limited_body(request: Request, max_bytes: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Payload too large.")
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Content-Length header.")
+
     chunks: list[bytes] = []
     total = 0
     async for chunk in request.stream():
@@ -1666,7 +2420,6 @@ class AppState:
             socket_connect_timeout=config.redis_socket_connect_timeout_seconds,
             socket_timeout=config.redis_socket_timeout_seconds,
             socket_keepalive=True,
-            retry_on_timeout=True,
         )
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(config.http_timeout_seconds, connect=5.0),
@@ -1678,9 +2431,10 @@ class AppState:
         )
         self.shutdown_event = asyncio.Event()
         self.tasks: list[asyncio.Task[Any]] = []
+        self.ingress_slots = asyncio.Semaphore(config.ingress_concurrency)
 
     @property
-    def ready_webhooks_key(self) -> str:
+    def ready_targets_key(self) -> str:
         return f"{self.config.queue_prefix}:ready:webhooks"
 
     @property
@@ -1688,8 +2442,16 @@ class AppState:
         return f"{self.config.queue_prefix}:processing:jobs"
 
     @property
-    def deadletter_stream_key(self) -> str:
-        return f"{self.config.queue_prefix}:deadletter"
+    def processing_meta_key(self) -> str:
+        return f"{self.config.queue_prefix}:processing:meta"
+
+    @property
+    def deadletter_index_key(self) -> str:
+        return f"{self.config.queue_prefix}:deadletter:index"
+
+    @property
+    def deadletter_bytes_key(self) -> str:
+        return f"{self.config.queue_prefix}:deadletter:bytes"
 
     @property
     def stats_key(self) -> str:
@@ -1700,56 +2462,91 @@ class AppState:
         return f"{self.config.queue_prefix}:pending:jobs"
 
     @property
-    def unique_webhooks_key(self) -> str:
+    def pending_bytes_key(self) -> str:
+        return f"{self.config.queue_prefix}:pending:bytes"
+
+    @property
+    def unique_webhooks_hll_key(self) -> str:
+        return f"{self.config.queue_prefix}:unique:webhooks:hll"
+
+    @property
+    def legacy_unique_webhooks_key(self) -> str:
         return f"{self.config.queue_prefix}:unique:webhooks"
+
+    @property
+    def idempotency_index_key(self) -> str:
+        return f"{self.config.queue_prefix}:idempotency:index"
 
     @property
     def global_backoff_key(self) -> str:
         return f"{self.config.queue_prefix}:discord:global-backoff"
 
+    @property
+    def global_dispatch_window_key(self) -> str:
+        return f"{self.config.queue_prefix}:discord:global-window"
+
+    @property
+    def invalid_request_window_key(self) -> str:
+        return f"{self.config.queue_prefix}:discord:invalid-window"
+
+    def webhook_backoff_key(self, webhook_key_value: str) -> str:
+        return f"{self.config.queue_prefix}:discord:webhook-backoff:{webhook_key_value}"
+
     def job_key(self, job_id: str) -> str:
         return f"{self.config.queue_prefix}:job:{job_id}"
 
-    def webhook_queue_key(self, webhook_key_value: str) -> str:
-        return f"{self.config.queue_prefix}:webhook-queue:{webhook_key_value}"
+    def target_queue_key(self, target_key_value: str) -> str:
+        return f"{self.config.queue_prefix}:webhook-queue:{target_key_value}"
+
+    def target_bytes_key(self, target_key_value: str) -> str:
+        return f"{self.config.queue_prefix}:pending:target-bytes:{target_key_value}"
+
+    def webhook_pending_key(self, webhook_key_value: str) -> str:
+        return f"{self.config.queue_prefix}:pending:webhook-jobs:{webhook_key_value}"
+
+    def webhook_bytes_key(self, webhook_key_value: str) -> str:
+        return f"{self.config.queue_prefix}:pending:webhook-bytes:{webhook_key_value}"
 
     def claim_key(self, job_id: str) -> str:
         return f"{self.config.queue_prefix}:claim:{job_id}"
 
-    def lock_key(self, webhook_key_value: str) -> str:
-        return f"{self.config.queue_prefix}:lock:{webhook_key_value}"
+    def lock_key(self, target_key_value: str) -> str:
+        return f"{self.config.queue_prefix}:lock:{target_key_value}"
+
+    def webhook_lock_key(self, webhook_key_value: str) -> str:
+        return f"{self.config.queue_prefix}:discord:webhook-lock:{webhook_key_value}"
 
     def idempotency_key(self, webhook_key_value: str, idempotency_key_value: str) -> str:
         return f"{self.config.queue_prefix}:idempotency:{webhook_key_value}:{sha256_text(idempotency_key_value)}"
 
-    def rate_limit_key(self, subject: str, subject_key: str, kind: str) -> str:
-        return f"{self.config.queue_prefix}:ratelimit:{subject}:{subject_key}:{kind}"
+    @property
+    def global_ingress_rate_limit_key(self) -> str:
+        return f"{self.config.queue_prefix}:ratelimit:global:window"
 
-    def log_sample_key(self, event: str, subject_key: str) -> str:
-        return f"{self.config.queue_prefix}:log-sample:{event}:{subject_key}"
+    def rate_limit_key(self, subject_key: str, kind: str) -> str:
+        return f"{self.config.queue_prefix}:ratelimit:webhook:{subject_key}:{kind}"
+
+    def deadletter_key(self, job_id: str) -> str:
+        return f"{self.config.queue_prefix}:deadletter:{job_id}"
 
     async def start(self) -> None:
         await self.redis.ping()
-        self.logger.info(
-            "Service ready",
-            extra={
-                "details": {
-                    "instance": self.instance_id,
-                    "replica_safe": "true",
-                    "dispatch_concurrency": self.config.dispatch_concurrency,
-                    "queue_prefix": self.config.queue_prefix,
-                    "blacklisted_webhooks": len(self.config.blacklisted_webhook_keys),
-                    "blacklisted_ip_rules": len(self.config.blacklisted_ip_networks),
-                }
-            },
-        )
-        for invalid in self.config.invalid_blacklisted_webhooks:
-            self.logger.warning("Invalid blacklisted webhook ignored", extra={"details": {"entry": truncate_text(invalid)}})
-        for invalid in self.config.invalid_blacklisted_ips:
-            self.logger.warning("Invalid blacklisted IP rule ignored", extra={"details": {"entry": truncate_text(invalid)}})
         for index in range(self.config.dispatch_concurrency):
             self.tasks.append(asyncio.create_task(self.worker_loop(index), name=f"worker-{index}"))
         self.tasks.append(asyncio.create_task(self.reclaim_loop(), name="reclaimer"))
+        log_event(
+            self.logger,
+            logging.INFO,
+            "Service ready",
+            {
+                "instance": self.instance_id,
+                "dispatch_concurrency": self.config.dispatch_concurrency,
+                "queue_prefix": self.config.queue_prefix,
+                "blacklisted_webhooks": len(self.config.blacklisted_webhook_keys),
+            },
+        )
+        for invalid in self.config.invalid_blacklisted_webhooks:
+            log_event(self.logger, logging.WARNING, "Invalid blacklisted webhook ignored", {"entry_hash": short_hash(invalid)})
 
     async def stop(self) -> None:
         self.shutdown_event.set()
@@ -1758,23 +2555,37 @@ class AppState:
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.http_client.aclose()
         await self.redis.aclose()
-        self.logger.info("Service stopped", extra={"details": {"instance": self.instance_id}})
+        log_event(self.logger, logging.INFO, "Service stopped", {"instance": self.instance_id})
 
     async def increment_stat(self, field: str, amount: int = 1) -> None:
         try:
             await self.redis.hincrby(self.stats_key, field, amount)
-        except Exception as exc:
-            self.logger.warning("Stat update failed", extra={"details": {"field": field, "error": truncate_text(str(exc))}})
+        except RedisError:
+            return
 
-    async def should_log_once(self, event: str, subject_key: str, seconds: int = 60) -> bool:
-        try:
-            return bool(await self.redis.set(self.log_sample_key(event, subject_key), "1", ex=seconds, nx=True))
-        except Exception:
-            return True
+    async def set_max_backoff(self, key: str, delay_seconds: float) -> None:
+        ttl_ms = max(1, int((delay_seconds + 0.25) * 1000))
+        await self.redis.eval(SET_MAX_BACKOFF_LUA, 1, key, str(ttl_ms))
 
     async def set_global_backoff(self, delay_seconds: float) -> None:
-        ttl_ms = max(1, int((delay_seconds + 0.1) * 1000))
-        await self.redis.psetex(self.global_backoff_key, ttl_ms, "1")
+        await self.set_max_backoff(self.global_backoff_key, delay_seconds)
+
+    async def set_webhook_backoff(self, webhook_key_value: str, delay_seconds: float) -> None:
+        await self.set_max_backoff(self.webhook_backoff_key(webhook_key_value), delay_seconds)
+
+    async def record_invalid_request(self) -> None:
+        try:
+            await self.redis.eval(
+                RECORD_INVALID_REQUEST_LUA,
+                3,
+                self.invalid_request_window_key,
+                self.global_backoff_key,
+                self.stats_key,
+                str(self.config.discord_invalid_request_limit),
+                str(self.config.discord_invalid_request_window_seconds * 1000),
+            )
+        except RedisError:
+            return
 
     async def sleep_if_global_backoff(self) -> bool:
         ttl_ms = await self.redis.pttl(self.global_backoff_key)
@@ -1783,30 +2594,23 @@ class AppState:
             return True
         return False
 
-    async def check_rate_limit(
-        self,
-        subject: str,
-        subject_key: str,
-        max_requests: int,
-        window_seconds: int,
-        block_after: int,
-        base_block_seconds: int,
-        max_block_seconds: int,
-        burst_multiplier: float,
-    ) -> dict[str, Any]:
+    async def check_rate_limit(self, subject_key: str) -> dict[str, Any]:
         result = await self.redis.eval(
             RATE_LIMIT_LUA,
-            3,
-            self.rate_limit_key(subject, subject_key, "window"),
-            self.rate_limit_key(subject, subject_key, "violations"),
-            self.rate_limit_key(subject, subject_key, "block"),
-            str(max_requests),
-            str(window_seconds),
+            4,
+            self.rate_limit_key(subject_key, "window"),
+            self.rate_limit_key(subject_key, "violations"),
+            self.rate_limit_key(subject_key, "block"),
+            self.global_ingress_rate_limit_key,
+            str(self.config.webhook_rate_limit_requests),
+            str(self.config.webhook_rate_limit_window_seconds),
             str(self.config.rate_limit_violation_ttl_seconds),
-            str(block_after),
-            str(base_block_seconds),
-            str(max_block_seconds),
-            str(burst_multiplier),
+            str(self.config.webhook_abuse_block_after),
+            str(self.config.webhook_abuse_base_block_seconds),
+            str(self.config.webhook_abuse_max_block_seconds),
+            str(self.config.webhook_abuse_burst_multiplier),
+            str(self.config.global_ingress_rate_limit_requests),
+            str(self.config.global_ingress_rate_limit_window_seconds),
         )
         allowed, retry_after, blocked, count, limit = result
         return {
@@ -1817,14 +2621,57 @@ class AppState:
             "limit": int(limit),
         }
 
-    async def claim_next_job(self) -> tuple[str, str] | None:
+    async def preflight_admission(
+        self,
+        webhook_key_value: str,
+        target_key_value: str,
+        priority: bool,
+        estimated_request_bytes: int,
+        check_target: bool = True,
+    ) -> str | None:
+        if priority:
+            pending_jobs, pending_bytes = await self.redis.mget(self.pending_jobs_key, self.pending_bytes_key)
+            if int(pending_jobs or 0) + 1 > self.config.absolute_queue_limit:
+                return "absolute_count_overloaded"
+            if int(pending_bytes or 0) + estimated_request_bytes > self.config.absolute_queue_bytes_limit:
+                return "absolute_bytes_overloaded"
+            return None
+
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.llen(self.target_queue_key(target_key_value))
+        pipe.get(self.webhook_pending_key(webhook_key_value))
+        pipe.get(self.pending_jobs_key)
+        pipe.get(self.target_bytes_key(target_key_value))
+        pipe.get(self.webhook_bytes_key(webhook_key_value))
+        pipe.get(self.pending_bytes_key)
+        target_count, webhook_count, global_count, target_bytes, webhook_bytes, global_bytes = await pipe.execute()
+
+        if check_target and int(target_count or 0) >= self.config.target_queue_limit:
+            return "target_count_overloaded"
+        if int(webhook_count or 0) >= self.config.webhook_queue_limit:
+            return "webhook_count_overloaded"
+        if int(global_count or 0) >= self.config.global_queue_limit:
+            return "global_count_overloaded"
+        if check_target and int(target_bytes or 0) + estimated_request_bytes > self.config.target_queue_bytes_limit:
+            return "target_bytes_overloaded"
+        if int(webhook_bytes or 0) + estimated_request_bytes > self.config.webhook_queue_bytes_limit:
+            return "webhook_bytes_overloaded"
+        if int(global_bytes or 0) + estimated_request_bytes > self.config.global_queue_bytes_limit:
+            return "global_bytes_overloaded"
+        return None
+
+    async def claim_next_job(self) -> tuple[str, str, str, str, str] | None:
+        claim_token = uuid.uuid4().hex
         result = await self.redis.eval(
             CLAIM_NEXT_JOB_LUA,
-            4,
-            self.ready_webhooks_key,
+            7,
+            self.ready_targets_key,
             self.processing_jobs_key,
+            self.processing_meta_key,
             self.global_backoff_key,
+            self.global_dispatch_window_key,
             self.pending_jobs_key,
+            self.pending_bytes_key,
             str(now_ms()),
             str(self.config.queue_scan_limit),
             self.instance_id,
@@ -1833,96 +2680,178 @@ class AppState:
             f"{self.config.queue_prefix}:job:",
             f"{self.config.queue_prefix}:claim:",
             f"{self.config.queue_prefix}:lock:",
+            f"{self.config.queue_prefix}:discord:webhook-lock:",
+            f"{self.config.queue_prefix}:discord:webhook-backoff:",
+            f"{self.config.queue_prefix}:pending:webhook-jobs:",
+            f"{self.config.queue_prefix}:pending:webhook-bytes:",
+            f"{self.config.queue_prefix}:pending:target-bytes:",
+            str(self.config.stale_cleanup_limit),
+            str(self.config.discord_global_requests_per_second),
+            claim_token,
+            str(max(25, int(self.config.poll_interval_seconds * 1000))),
         )
         if not result:
             return None
-        job_id, webhook_key_value = result
-        return str(job_id), str(webhook_key_value)
+        job_id, target_key_value, queue_entry, webhook_key_value, returned_token, _ = result
+        return str(job_id), str(target_key_value), str(queue_entry), str(webhook_key_value), str(returned_token)
 
-    async def finalize_job(self, job_id: str, webhook_key_value: str, delete_job: bool) -> None:
-        await self.redis.eval(
+    async def finalize_job(
+        self,
+        job_id: str,
+        target_key_value: str,
+        queue_entry: str,
+        webhook_key_value: str,
+        claim_token: str,
+        delete_job: bool = True,
+    ) -> str:
+        result = await self.redis.eval(
             FINALIZE_JOB_LUA,
-            3,
-            self.ready_webhooks_key,
+            13,
+            self.ready_targets_key,
             self.processing_jobs_key,
+            self.processing_meta_key,
             self.pending_jobs_key,
+            self.pending_bytes_key,
+            self.job_key(job_id),
+            self.target_queue_key(target_key_value),
+            self.claim_key(job_id),
+            self.lock_key(target_key_value),
+            self.webhook_pending_key(webhook_key_value),
+            self.webhook_bytes_key(webhook_key_value),
+            self.target_bytes_key(target_key_value),
+            self.webhook_lock_key(webhook_key_value),
             job_id,
+            target_key_value,
+            queue_entry,
             webhook_key_value,
-            f"{self.config.queue_prefix}:webhook-queue:",
+            claim_token,
+            "1" if delete_job else "0",
             f"{self.config.queue_prefix}:job:",
+            f"{self.config.queue_prefix}:webhook-queue:",
             f"{self.config.queue_prefix}:claim:",
             f"{self.config.queue_prefix}:lock:",
-            "1" if delete_job else "0",
+            f"{self.config.queue_prefix}:pending:webhook-jobs:",
+            f"{self.config.queue_prefix}:pending:webhook-bytes:",
+            f"{self.config.queue_prefix}:pending:target-bytes:",
+            str(self.config.stale_cleanup_limit),
+            str(now_ms()),
         )
+        return str(result[0]) if result else "unknown"
 
     async def reschedule_job(
         self,
         job_id: str,
+        target_key_value: str,
+        queue_entry: str,
         webhook_key_value: str,
+        claim_token: str,
         next_available_at_ms: int,
         attempts: int,
         last_error: str,
         last_status: str,
-    ) -> None:
-        await self.redis.eval(
+    ) -> str:
+        result = await self.redis.eval(
             RESCHEDULE_JOB_LUA,
-            2,
-            self.ready_webhooks_key,
+            7,
+            self.ready_targets_key,
             self.processing_jobs_key,
+            self.processing_meta_key,
+            self.job_key(job_id),
+            self.claim_key(job_id),
+            self.lock_key(target_key_value),
+            self.webhook_lock_key(webhook_key_value),
             job_id,
-            webhook_key_value,
+            target_key_value,
             str(next_available_at_ms),
             str(attempts),
             last_error,
             last_status,
             str(self.config.job_ttl_seconds),
-            f"{self.config.queue_prefix}:webhook-queue:",
-            f"{self.config.queue_prefix}:job:",
-            f"{self.config.queue_prefix}:claim:",
-            f"{self.config.queue_prefix}:lock:",
+            claim_token,
         )
+        state = str(result[0]) if result else "unknown"
+        if state == "missing":
+            return await self.finalize_job(
+                job_id,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                delete_job=True,
+            )
+        return state
 
     async def enqueue_job(
         self,
         webhook_id: str,
         webhook_token: str,
+        webhook_key_value: str,
+        target_key_value: str,
+        target_context: str,
         query_string: str,
         body: bytes,
         content_type: str,
-        source_ip: str,
+        priority: bool,
         idempotency_key_value: str | None,
     ) -> dict[str, Any]:
         job_id = uuid.uuid4().hex
         request_id = uuid.uuid4().hex
         created_at_ms = now_ms()
-        webhook_key_value = webhook_key(webhook_id, webhook_token)
         body_sha256 = sha256_bytes(body)
+        request_sha256 = request_fingerprint(body, query_string, content_type)
+        body_b64 = encode_body(body)
+        storage_bytes = estimated_storage_bytes(
+            body_b64,
+            query_string,
+            content_type,
+            webhook_token,
+            self.config.storage_overhead_bytes,
+        )
         idem_key_name = self.idempotency_key(webhook_key_value, idempotency_key_value) if idempotency_key_value else ""
 
         result = await self.redis.eval(
             ENQUEUE_JOB_LUA,
-            7,
+            12,
             self.job_key(job_id),
-            self.webhook_queue_key(webhook_key_value),
-            self.ready_webhooks_key,
+            self.target_queue_key(target_key_value),
+            self.ready_targets_key,
             self.pending_jobs_key,
-            self.unique_webhooks_key,
+            self.pending_bytes_key,
+            self.webhook_pending_key(webhook_key_value),
+            self.webhook_bytes_key(webhook_key_value),
+            self.target_bytes_key(target_key_value),
+            self.unique_webhooks_hll_key,
             self.stats_key,
             idem_key_name,
+            self.idempotency_index_key,
             job_id,
             request_id,
             webhook_id,
             webhook_token,
             webhook_key_value,
+            target_key_value,
+            target_context,
             query_string,
-            encode_body(body),
+            body_b64,
             content_type,
-            source_ip,
             str(created_at_ms),
             body_sha256,
+            request_sha256,
             idempotency_key_value or "",
             str(self.config.job_ttl_seconds),
             str(self.config.idempotency_ttl_seconds),
+            str(storage_bytes),
+            "1" if priority else "0",
+            str(self.config.target_queue_limit),
+            str(self.config.webhook_queue_limit),
+            str(self.config.global_queue_limit),
+            str(self.config.target_queue_bytes_limit),
+            str(self.config.webhook_queue_bytes_limit),
+            str(self.config.global_queue_bytes_limit),
+            str(self.config.absolute_queue_limit),
+            str(self.config.absolute_queue_bytes_limit),
+            str(self.config.idempotency_max_entries),
+            str(self.config.idempotency_cleanup_limit),
         )
 
         result_status = str(result[0])
@@ -1932,13 +2861,24 @@ class AppState:
         if result_status == "conflict":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Conflicting payload for the same idempotency key.",
+                detail="Conflicting request for the same idempotency key.",
             )
 
+        if result_status.endswith("_overloaded"):
+            return {
+                "status": result_status,
+                "request_id": result_request_id,
+                "job_id": result_job_id,
+                "duplicate": False,
+                "storage_bytes": storage_bytes,
+            }
+
         return {
+            "status": result_status,
             "request_id": result_request_id,
             "duplicate": result_status == "duplicate",
             "job_id": result_job_id,
+            "storage_bytes": storage_bytes,
         }
 
     async def push_deadletter(
@@ -1947,20 +2887,68 @@ class AppState:
         reason: str,
         status_code: int | None,
         response_excerpt: str,
+        attempts: int,
     ) -> None:
+        body_b64 = job.get("body_b64", "")
+        body_bytes = 0
+        try:
+            body_bytes = len(base64.b64decode(body_b64, validate=True))
+        except (ValueError, TypeError):
+            body_b64 = ""
+
+        payload_omitted = body_bytes > self.config.deadletter_payload_max_bytes
+        if payload_omitted:
+            body_b64 = ""
+
         fields = {
             "job_id": job.get("job_id", ""),
             "request_id": job.get("request_id", ""),
-            "webhook_ref": webhook_ref(job["webhook_id"], job["webhook_token"]),
+            "webhook_id": job.get("webhook_id", ""),
+            "webhook_token": job.get("webhook_token", ""),
+            "webhook_ref": webhook_ref(job.get("webhook_id", ""), job.get("webhook_token", "")),
+            "webhook_key": job.get("webhook_key", ""),
+            "target_key": job.get("target_key", job.get("webhook_key", "")),
+            "target_context": job.get("target_context", "webhook"),
+            "query_string": job.get("query_string", ""),
+            "content_type": job.get("content_type", ""),
+            "body_b64": body_b64,
+            "payload_omitted": "1" if payload_omitted else "0",
             "reason": reason,
             "status_code": "" if status_code is None else str(status_code),
-            "attempts": job.get("attempts", "0"),
+            "attempts": str(attempts),
             "created_at_ms": job.get("created_at_ms", "0"),
             "finalized_at_ms": str(now_ms()),
             "response_excerpt": response_excerpt,
+            "request_sha256": job.get("request_sha256", ""),
         }
-        await self.redis.xadd(self.deadletter_stream_key, fields, maxlen=self.config.deadletter_maxlen, approximate=True)
-        await self.increment_stat("deadletter")
+        storage_bytes = (
+            sum(len(key) + len(value) for key, value in fields.items())
+            + self.config.storage_overhead_bytes
+            + 64
+        )
+        fields["storage_bytes"] = str(storage_bytes)
+        arguments: list[str] = []
+        for key, value in fields.items():
+            arguments.extend([key, value])
+
+        await self.redis.eval(
+            PUSH_DEADLETTER_LUA,
+            4,
+            self.deadletter_index_key,
+            self.deadletter_key(job["job_id"]),
+            self.stats_key,
+            self.deadletter_bytes_key,
+            str(self.config.deadletter_ttl_seconds),
+            str(self.config.deadletter_max_entries),
+            str(now_ms()),
+            f"{self.config.queue_prefix}:deadletter:",
+            "100",
+            str(len(fields)),
+            job["job_id"],
+            str(storage_bytes),
+            str(self.config.deadletter_bytes_limit),
+            *arguments,
+        )
 
     async def worker_loop(self, worker_index: int) -> None:
         while not self.shutdown_event.is_set():
@@ -1973,91 +2961,136 @@ class AppState:
                     await asyncio.sleep(self.config.poll_interval_seconds)
                     continue
 
-                job_id, webhook_key_value = claim
+                job_id, target_key_value, queue_entry, webhook_key_value, claim_token = claim
                 job = await self.redis.hgetall(self.job_key(job_id))
                 if not job:
-                    await self.finalize_job(job_id, webhook_key_value, delete_job=False)
-                    self.logger.warning(
-                        "Claimed job disappeared before processing",
-                        extra={"details": {"job_id": job_id, "worker": worker_index}},
+                    await self.finalize_job(
+                        job_id,
+                        target_key_value,
+                        queue_entry,
+                        webhook_key_value,
+                        claim_token,
+                        delete_job=True,
                     )
                     continue
 
-                await self.process_job(job, webhook_key_value, worker_index)
+                await self.process_job(
+                    job,
+                    target_key_value,
+                    queue_entry,
+                    webhook_key_value,
+                    claim_token,
+                    worker_index,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.logger.error(
+                log_event(
+                    self.logger,
+                    logging.ERROR,
                     "Worker loop fault",
-                    extra={"details": {"worker": worker_index, "error": truncate_text(str(exc))}},
+                    {"worker": worker_index, "fault": truncate_text(str(exc))},
                 )
                 await asyncio.sleep(self.config.poll_interval_seconds)
 
-    async def process_job(self, job: dict[str, str], webhook_key_value: str, worker_index: int) -> None:
+    async def process_job(
+        self,
+        job: dict[str, str],
+        target_key_value: str,
+        queue_entry: str,
+        webhook_key_value: str,
+        claim_token: str,
+        worker_index: int,
+    ) -> None:
         job_id = job["job_id"]
         attempts = int(job.get("attempts", "0"))
-        request_id = job.get("request_id", "")
         url = build_discord_url(job["webhook_id"], job["webhook_token"], job.get("query_string", ""))
-        body = decode_body(job["body_b64"])
+        try:
+            body = decode_body(job["body_b64"])
+        except (ValueError, TypeError) as exc:
+            failed_attempts = attempts + 1
+            await self.push_deadletter(job, "corrupt_stored_payload", None, truncate_text(str(exc)), failed_attempts)
+            await self.finalize_job(job_id, target_key_value, queue_entry, webhook_key_value, claim_token)
+            return
+
         headers = {
             "Content-Type": job.get("content_type", "application/json"),
-            "User-Agent": "discord-webhook-proxy/3.0",
+            "User-Agent": "discord-webhook-proxy/4.0",
         }
-
-        self.logger.info(
-            "Dispatch started",
-            extra={
-                "details": {
-                    "request_id": request_id,
-                    "job_id": job_id,
-                    "worker": worker_index,
-                    "attempt": attempts + 1,
-                    "webhook": webhook_ref(job["webhook_id"], job["webhook_token"]),
-                    "bytes": len(body),
-                }
-            },
-        )
 
         try:
             response = await self.http_client.post(url, content=body, headers=headers)
         except httpx.TimeoutException as exc:
-            await self.handle_retry(job, webhook_key_value, attempts + 1, "upstream_timeout", "", retry_delay_seconds(attempts + 1, self.config), exc)
+            await self.handle_retry(
+                job,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                attempts + 1,
+                "upstream_timeout",
+                "",
+                retry_delay_seconds(attempts + 1, self.config),
+                exc,
+            )
             return
         except httpx.RequestError as exc:
-            await self.handle_retry(job, webhook_key_value, attempts + 1, "network_error", "", retry_delay_seconds(attempts + 1, self.config), exc)
+            await self.handle_retry(
+                job,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                attempts + 1,
+                "network_error",
+                "",
+                retry_delay_seconds(attempts + 1, self.config),
+                exc,
+            )
             return
 
         status_code = response.status_code
         response_excerpt = truncate_text(response.text.strip()) if response.text else ""
 
+        if status_code in {401, 403, 429}:
+            await self.record_invalid_request()
+
+        reset_after = get_bucket_reset_after_seconds(response)
+        if reset_after is not None and reset_after > 0:
+            await self.set_webhook_backoff(webhook_key_value, reset_after)
+
         if 200 <= status_code < 300:
-            await self.finalize_job(job_id, webhook_key_value, delete_job=True)
+            await self.finalize_job(job_id, target_key_value, queue_entry, webhook_key_value, claim_token)
             await self.increment_stat("sent")
-            self.logger.info(
-                "Webhook sent",
-                extra={
-                    "details": {
-                        "request_id": request_id,
-                        "job_id": job_id,
-                        "status": status_code,
-                        "worker": worker_index,
-                        "webhook": webhook_ref(job["webhook_id"], job["webhook_token"]),
-                    }
-                },
-            )
             return
 
         if status_code == 429:
             retry_after = get_retry_after_seconds(response)
             if is_global_rate_limited(response):
                 await self.set_global_backoff(retry_after)
-            await self.handle_retry(job, webhook_key_value, attempts + 1, "rate_limited", str(status_code), retry_after, response_excerpt)
+            else:
+                await self.set_webhook_backoff(webhook_key_value, retry_after)
+            await self.handle_retry(
+                job,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                attempts + 1,
+                "rate_limited",
+                str(status_code),
+                retry_delay_seconds(attempts + 1, self.config, retry_after),
+                response_excerpt,
+            )
             return
 
         if status_code >= 500 or status_code in {408, 409, 425}:
             await self.handle_retry(
                 job,
+                target_key_value,
+                queue_entry,
                 webhook_key_value,
+                claim_token,
                 attempts + 1,
                 "upstream_error",
                 str(status_code),
@@ -2066,25 +3099,23 @@ class AppState:
             )
             return
 
-        await self.push_deadletter(job, "non_retryable_upstream_response", status_code, response_excerpt)
-        await self.finalize_job(job_id, webhook_key_value, delete_job=True)
-        self.logger.error(
-            "Webhook rejected by Discord",
-            extra={
-                "details": {
-                    "request_id": request_id,
-                    "job_id": job_id,
-                    "status": status_code,
-                    "webhook": webhook_ref(job["webhook_id"], job["webhook_token"]),
-                    "response": response_excerpt or "-",
-                }
-            },
+        failed_attempts = attempts + 1
+        await self.push_deadletter(
+            job,
+            "non_retryable_upstream_response",
+            status_code,
+            response_excerpt,
+            failed_attempts,
         )
+        await self.finalize_job(job_id, target_key_value, queue_entry, webhook_key_value, claim_token)
 
     async def handle_retry(
         self,
         job: dict[str, str],
+        target_key_value: str,
+        queue_entry: str,
         webhook_key_value: str,
+        claim_token: str,
         attempts: int,
         reason: str,
         status_value: str,
@@ -2092,51 +3123,32 @@ class AppState:
         error_value: Any,
     ) -> None:
         job_id = job["job_id"]
-        request_id = job.get("request_id", "")
-        if attempts >= self.config.max_attempts:
+        if attempts > self.config.max_retries:
             response_excerpt = truncate_text(str(error_value))
-            await self.push_deadletter(job, f"{reason}_max_attempts_exhausted", int(status_value) if status_value.isdigit() else None, response_excerpt)
-            await self.finalize_job(job_id, webhook_key_value, delete_job=True)
-            self.logger.error(
-                "Webhook permanently failed",
-                extra={
-                    "details": {
-                        "request_id": request_id,
-                        "job_id": job_id,
-                        "attempts": attempts,
-                        "reason": reason,
-                        "status": status_value or "-",
-                        "webhook": webhook_ref(job["webhook_id"], job["webhook_token"]),
-                        "error": response_excerpt,
-                    }
-                },
+            await self.push_deadletter(
+                job,
+                f"{reason}_max_retries_exhausted",
+                int(status_value) if status_value.isdigit() else None,
+                response_excerpt,
+                attempts,
             )
+            await self.finalize_job(job_id, target_key_value, queue_entry, webhook_key_value, claim_token)
             return
 
         next_available_at = now_ms() + int(delay_seconds * 1000)
-        await self.reschedule_job(
+        state = await self.reschedule_job(
             job_id=job_id,
+            target_key_value=target_key_value,
+            queue_entry=queue_entry,
             webhook_key_value=webhook_key_value,
+            claim_token=claim_token,
             next_available_at_ms=next_available_at,
             attempts=attempts,
             last_error=truncate_text(str(error_value), 500),
             last_status=status_value,
         )
-        await self.increment_stat("retried")
-        self.logger.warning(
-            "Webhook rescheduled",
-            extra={
-                "details": {
-                    "request_id": request_id,
-                    "job_id": job_id,
-                    "attempts": attempts,
-                    "retry_in_seconds": round(delay_seconds, 3),
-                    "reason": reason,
-                    "status": status_value or "-",
-                    "webhook": webhook_ref(job["webhook_id"], job["webhook_token"]),
-                }
-            },
-        )
+        if state == "rescheduled":
+            await self.increment_stat("retried")
 
     async def reclaim_loop(self) -> None:
         while not self.shutdown_event.is_set():
@@ -2146,10 +3158,7 @@ class AppState:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.logger.error(
-                    "Reclaimer fault",
-                    extra={"details": {"error": truncate_text(str(exc))}},
-                )
+                log_event(self.logger, logging.ERROR, "Reclaimer fault", {"fault": truncate_text(str(exc))})
 
     async def reclaim_expired_jobs(self) -> None:
         expired_ids = await self.redis.zrangebyscore(
@@ -2163,39 +3172,32 @@ class AppState:
             return
 
         reclaimed = 0
-
         for job_id in expired_ids:
-            claim_ttl = await self.redis.pttl(self.claim_key(job_id))
-            if claim_ttl > 0:
-                await self.redis.zadd(self.processing_jobs_key, {job_id: now_ms() + claim_ttl})
-                continue
-
-            job = await self.redis.hgetall(self.job_key(job_id))
-            if not job:
-                await self.redis.zrem(self.processing_jobs_key, job_id)
-                pending = await self.redis.decr(self.pending_jobs_key)
-                if int(pending) < 0:
-                    await self.redis.set(self.pending_jobs_key, "0")
-                continue
-
-            webhook_key_value = job["webhook_key"]
-            await self.redis.hset(self.job_key(job_id), mapping={"available_at_ms": str(now_ms()), "last_error": "reclaimed_after_visibility_timeout"})
-            lock_key_name = self.lock_key(webhook_key_value)
-            if await self.redis.get(lock_key_name) == job_id:
-                await self.redis.delete(lock_key_name)
-            await self.redis.zrem(self.processing_jobs_key, job_id)
-            await self.redis.zadd(self.ready_webhooks_key, {webhook_key_value: now_ms()})
-            reclaimed += 1
-            self.logger.warning(
-                "Orphaned dispatch reclaimed",
-                extra={
-                    "details": {
-                        "job_id": job_id,
-                        "request_id": job.get("request_id", ""),
-                        "webhook": webhook_ref(job["webhook_id"], job["webhook_token"]),
-                    }
-                },
+            result = await self.redis.eval(
+                RECLAIM_JOB_LUA,
+                7,
+                self.ready_targets_key,
+                self.processing_jobs_key,
+                self.processing_meta_key,
+                self.pending_jobs_key,
+                self.pending_bytes_key,
+                self.job_key(job_id),
+                self.claim_key(job_id),
+                job_id,
+                str(now_ms()),
+                str(self.config.job_ttl_seconds),
+                f"{self.config.queue_prefix}:webhook-queue:",
+                f"{self.config.queue_prefix}:job:",
+                f"{self.config.queue_prefix}:lock:",
+                f"{self.config.queue_prefix}:pending:webhook-jobs:",
+                f"{self.config.queue_prefix}:pending:webhook-bytes:",
+                f"{self.config.queue_prefix}:pending:target-bytes:",
+                f"{self.config.queue_prefix}:discord:webhook-lock:",
+                str(self.config.stale_cleanup_limit),
             )
+            state = str(result[0]) if result else "unknown"
+            if state == "reclaimed":
+                reclaimed += 1
 
         if reclaimed:
             await self.increment_stat("reclaimed", reclaimed)
@@ -2210,8 +3212,8 @@ def get_state(request: Request) -> AppState:
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
-    logger = configure_logging()
     config = Config()
+    logger = configure_logging(config.log_level)
     state = AppState(config, logger)
     app_instance.state.state = state
     await state.start()
@@ -2223,8 +3225,8 @@ async def lifespan(app_instance: FastAPI):
 
 app = FastAPI(
     title="Discord Webhook Proxy",
-    description="A Secure, Self-Healing Proxy for Discord Webhooks.",
-    version="3.0.0",
+    description="A queue-bounded, rate-limit-aware relay for Discord webhooks.",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -2241,6 +3243,26 @@ async def security_headers_middleware(request: Request, call_next):
     if request.url.scheme == "https":
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
+
+
+@app.middleware("http")
+async def ingress_capacity_middleware(request: Request, call_next):
+    if request.method != "POST" or not request.url.path.startswith("/api/webhooks/"):
+        return await call_next(request)
+    state = get_state(request)
+    try:
+        await asyncio.wait_for(state.ingress_slots.acquire(), timeout=state.config.ingress_wait_seconds)
+    except TimeoutError:
+        await state.increment_stat("ingress_rejected")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "1"},
+            content={"error": "Proxy request capacity reached.", "retry_after": 1},
+        )
+    try:
+        return await call_next(request)
+    finally:
+        state.ingress_slots.release()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2282,17 +3304,32 @@ async def og_image() -> Response:
 async def api_stats(request: Request) -> JSONResponse:
     state = get_state(request)
     try:
-        stats = integer_dict(await state.redis.hgetall(state.stats_key))
-        unique_webhooks = int(await state.redis.scard(state.unique_webhooks_key))
-        pending_jobs = int(await state.redis.get(state.pending_jobs_key) or 0)
-        ready_webhooks = int(await state.redis.zcard(state.ready_webhooks_key))
-        processing_jobs = int(await state.redis.zcard(state.processing_jobs_key))
+        pipe = state.redis.pipeline(transaction=False)
+        pipe.hgetall(state.stats_key)
+        pipe.pfcount(state.unique_webhooks_hll_key)
+        pipe.scard(state.legacy_unique_webhooks_key)
+        pipe.get(state.pending_jobs_key)
+        pipe.get(state.pending_bytes_key)
+        pipe.zcard(state.ready_targets_key)
+        pipe.zcard(state.processing_jobs_key)
+        pipe.get(state.deadletter_bytes_key)
+        (
+            stats_raw,
+            hll_webhooks,
+            legacy_webhooks,
+            pending_jobs,
+            pending_bytes,
+            ready_targets,
+            processing_jobs,
+            deadletter_bytes,
+        ) = await pipe.execute()
+        stats = integer_dict(stats_raw)
         requests_served = stats.get("accepted", 0) + stats.get("duplicates", 0)
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             headers={"Cache-Control": "no-store"},
             content={
-                "unique_webhooks": unique_webhooks,
+                "unique_webhooks": max(int(hll_webhooks or 0), int(legacy_webhooks or 0)),
                 "requests_served": requests_served,
                 "accepted": stats.get("accepted", 0),
                 "duplicates": stats.get("duplicates", 0),
@@ -2301,15 +3338,19 @@ async def api_stats(request: Request) -> JSONResponse:
                 "rejected": stats.get("rejected", 0),
                 "blocked": stats.get("blocked", 0),
                 "rate_limited": stats.get("rate_limited", 0),
+                "invalid_requests": stats.get("invalid_requests", 0),
                 "deadletter": stats.get("deadletter", 0),
+                "deadletter_dropped": stats.get("deadletter_dropped", 0),
+                "deadletter_bytes": max(int(deadletter_bytes or 0), 0),
                 "reclaimed": stats.get("reclaimed", 0),
-                "pending_jobs": max(pending_jobs, 0),
-                "ready_webhooks": ready_webhooks,
-                "processing_jobs": processing_jobs,
+                "ingress_rejected": stats.get("ingress_rejected", 0),
+                "pending_jobs": max(int(pending_jobs or 0), 0),
+                "pending_bytes": max(int(pending_bytes or 0), 0),
+                "ready_targets": int(ready_targets or 0),
+                "processing_jobs": int(processing_jobs or 0),
             },
         )
-    except Exception as exc:
-        state.logger.error("Stats endpoint failed", extra={"details": {"error": truncate_text(str(exc))}})
+    except RedisError:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"error": "Stats are temporarily unavailable."},
@@ -2321,34 +3362,18 @@ async def healthz(request: Request) -> JSONResponse:
     state = get_state(request)
     try:
         await state.redis.ping()
-        ready_webhooks = await state.redis.zcard(state.ready_webhooks_key)
-        processing_jobs = await state.redis.zcard(state.processing_jobs_key)
-        pending_jobs = int(await state.redis.get(state.pending_jobs_key) or 0)
-        stats = await state.redis.hgetall(state.stats_key)
-        global_backoff_ms = await state.redis.pttl(state.global_backoff_key)
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={
-                "status": "ok",
-                "instance": state.instance_id,
-                "ready_webhooks": ready_webhooks,
-                "processing_jobs": processing_jobs,
-                "pending_jobs": max(pending_jobs, 0),
-                "global_backoff_ms": max(int(global_backoff_ms), 0),
-                "stats": stats,
-            },
-        )
-    except Exception as exc:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "degraded", "error": truncate_text(str(exc))},
-        )
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "ok"})
+    except RedisError:
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"status": "degraded"})
 
 
 @app.get("/readyz")
 async def readyz(request: Request) -> Response:
     state = get_state(request)
-    await state.redis.ping()
+    try:
+        await state.redis.ping()
+    except RedisError:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -2362,30 +3387,32 @@ async def reject_request(
     status_code: int,
     error: str,
     stat: str,
-    log_message: str,
-    details: dict[str, Any],
     retry_after: int | None = None,
 ) -> JSONResponse:
     await state.increment_stat(stat)
-    log_details = dict(details)
-    if retry_after is not None:
-        log_details["retry_after"] = retry_after
-    state.logger.warning(log_message, extra={"details": log_details})
     headers = {"Retry-After": str(max(1, retry_after))} if retry_after is not None else None
-    return JSONResponse(status_code=status_code, content={"error": error}, headers=headers)
+    content: dict[str, Any] = {"error": error}
+    if retry_after is not None:
+        content["retry_after"] = max(1, retry_after)
+    return JSONResponse(status_code=status_code, content=content, headers=headers)
+
+
+def overload_message(reason: str) -> str:
+    if reason.startswith("global_") or reason.startswith("absolute_"):
+        return "Global queue overloaded"
+    if reason.startswith("target_"):
+        return "Webhook target queue overloaded"
+    return "Webhook queue overloaded"
 
 
 @app.post("/api/webhooks/{webhook_id}/{webhook_token}")
 async def proxy_webhook(
     request: Request,
-    webhook_id: str = FastAPIPath(..., pattern=r"^\d+$"),
-    webhook_token: str = FastAPIPath(..., pattern=r"^[A-Za-z0-9_-]+$"),
+    webhook_id: str = FastAPIPath(..., pattern=r"^\d+$", max_length=20),
+    webhook_token: str = FastAPIPath(..., pattern=r"^[A-Za-z0-9_-]+$", max_length=256),
 ) -> JSONResponse:
     state = get_state(request)
-    source_ip = extract_client_ip(request, state.config.trust_proxy_headers)
-    query_string = request.url.query
     webhook_key_value = webhook_key(webhook_id, webhook_token)
-    webhook_reference = webhook_ref(webhook_id, webhook_token)
 
     if webhook_key_value in state.config.blacklisted_webhook_keys:
         return await reject_request(
@@ -2393,111 +3420,113 @@ async def proxy_webhook(
             status.HTTP_403_FORBIDDEN,
             "This webhook is blocked from using the proxy.",
             "blocked",
-            "Request blocked",
-            {"reason": "blacklisted_webhook", "source_ip": source_ip, "webhook": webhook_reference},
         )
 
-    if ip_in_networks(source_ip, state.config.blacklisted_ip_networks):
+    api_key_headers = request.headers.getlist("x-api-key")
+    if len(api_key_headers) > 1:
         return await reject_request(
             state,
-            status.HTTP_403_FORBIDDEN,
-            "This IP address is blocked from using the proxy.",
-            "blocked",
-            "Request blocked",
-            {"reason": "blacklisted_ip", "source_ip": source_ip, "webhook": webhook_reference},
+            status.HTTP_400_BAD_REQUEST,
+            "X-Api-Key may be provided only once.",
+            "rejected",
         )
 
-    webhook_limit = await state.check_rate_limit(
-        "webhook",
-        webhook_key_value,
-        state.config.webhook_rate_limit_requests,
-        state.config.webhook_rate_limit_window_seconds,
-        state.config.webhook_abuse_block_after,
-        state.config.webhook_abuse_base_block_seconds,
-        state.config.webhook_abuse_max_block_seconds,
-        state.config.webhook_abuse_burst_multiplier,
+    try:
+        query_string, priority, thread_id = sanitize_query_string(
+            request.url.query,
+            state.config,
+            api_key_headers[0] if api_key_headers else None,
+        )
+    except HTTPException as exc:
+        return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
+
+    idempotency_headers = (
+        request.headers.getlist("x-idempotency-key")
+        + request.headers.getlist("idempotency-key")
     )
-    if not webhook_limit["allowed"]:
-        event = "webhook_blocked" if webhook_limit["blocked"] else "webhook_rate_limited"
-        stat_name = "blocked" if webhook_limit["blocked"] else "rate_limited"
-        if await state.should_log_once(event, webhook_key_value):
-            state.logger.warning(
-                "Request throttled",
-                extra={
-                    "details": {
-                        "reason": event,
-                        "source_ip": source_ip,
-                        "webhook": webhook_reference,
-                        "count": webhook_limit["count"],
-                        "limit": webhook_limit["limit"],
-                        "retry_after": webhook_limit["retry_after"],
-                    }
-                },
-            )
-        await state.increment_stat(stat_name)
+    if len(idempotency_headers) > 1:
+        return await reject_request(
+            state,
+            status.HTTP_400_BAD_REQUEST,
+            "Idempotency key may be provided only once.",
+            "rejected",
+        )
+    idempotency_key_value = idempotency_headers[0] if idempotency_headers else None
+    if idempotency_key_value and len(idempotency_key_value) > state.config.max_idempotency_key_length:
+        return await reject_request(
+            state,
+            status.HTTP_400_BAD_REQUEST,
+            "Idempotency key too large.",
+            "rejected",
+        )
+
+    try:
+        rate_limit = await state.check_rate_limit(webhook_key_value)
+    except RedisError:
+        return await reject_request(
+            state,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Queue storage is temporarily unavailable.",
+            "rejected",
+            1,
+        )
+    if not rate_limit["allowed"]:
+        await state.increment_stat("blocked" if rate_limit["blocked"] else "rate_limited")
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            headers={"Retry-After": str(max(1, webhook_limit["retry_after"]))},
-            content={"error": "Temporarily rate limited. Slow down before retrying."},
+            headers={"Retry-After": str(max(1, rate_limit["retry_after"]))},
+            content={
+                "error": "Temporarily rate limited. Slow down before retrying.",
+                "retry_after": max(1, rate_limit["retry_after"]),
+            },
         )
 
-    if state.config.ip_rate_limit_enabled:
-        ip_key = sha256_text(source_ip)
-        ip_limit = await state.check_rate_limit(
-            "ip",
-            ip_key,
-            state.config.ip_rate_limit_requests,
-            state.config.ip_rate_limit_window_seconds,
-            state.config.ip_abuse_block_after,
-            state.config.ip_abuse_base_block_seconds,
-            state.config.ip_abuse_max_block_seconds,
-            state.config.ip_abuse_burst_multiplier,
-        )
-        if not ip_limit["allowed"]:
-            event = "ip_blocked" if ip_limit["blocked"] else "ip_rate_limited"
-            stat_name = "blocked" if ip_limit["blocked"] else "rate_limited"
-            if await state.should_log_once(event, ip_key):
-                state.logger.warning(
-                    "Request throttled",
-                    extra={
-                        "details": {
-                            "reason": event,
-                            "source_ip": source_ip,
-                            "webhook": webhook_reference,
-                            "count": ip_limit["count"],
-                            "limit": ip_limit["limit"],
-                            "retry_after": ip_limit["retry_after"],
-                        }
-                    },
-                )
-            await state.increment_stat(stat_name)
-            return JSONResponse(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                headers={"Retry-After": str(max(1, ip_limit["retry_after"]))},
-                content={"error": "Temporarily rate limited. Slow down before retrying."},
+    normalized_content_type = normalize_content_type(request.headers.get("content-type", ""))
+    preliminary_context = f"thread_id:{thread_id}" if thread_id else "webhook"
+    preliminary_target_key = target_key(webhook_key_value, preliminary_context)
+    content_length = request.headers.get("content-length")
+    estimated_request_bytes = state.config.storage_overhead_bytes
+    if content_length:
+        try:
+            estimated_request_bytes += max(0, int(content_length) * 4 // 3)
+        except ValueError:
+            return await reject_request(
+                state,
+                status.HTTP_400_BAD_REQUEST,
+                "Invalid Content-Length header.",
+                "rejected",
             )
 
-    if len(query_string) > state.config.max_query_length:
-        return await reject_request(
-            state,
-            status.HTTP_414_REQUEST_URI_TOO_LONG,
-            "Query string too large.",
-            "rejected",
-            "Request rejected",
-            {"reason": "query_too_large", "source_ip": source_ip, "webhook": webhook_reference, "query_length": len(query_string)},
-        )
+    if not idempotency_key_value:
+        try:
+            preflight_reason = await state.preflight_admission(
+                webhook_key_value,
+                preliminary_target_key,
+                priority,
+                estimated_request_bytes,
+                check_target=thread_id is not None or normalized_content_type not in {"application/json", "text/json"},
+            )
+        except RedisError:
+            return await reject_request(
+                state,
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Queue storage is temporarily unavailable.",
+                "rejected",
+                1,
+            )
+        if preflight_reason:
+            return await reject_request(
+                state,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                overload_message(preflight_reason),
+                "rejected",
+                state.config.overload_retry_after_seconds,
+            )
 
     try:
         body = await read_limited_body(request, state.config.max_body_bytes)
     except HTTPException as exc:
-        return await reject_request(
-            state,
-            exc.status_code,
-            str(exc.detail),
-            "rejected",
-            "Request rejected",
-            {"reason": "body_too_large", "source_ip": source_ip, "webhook": webhook_reference},
-        )
+        return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
 
     if not body:
         return await reject_request(
@@ -2505,34 +3534,26 @@ async def proxy_webhook(
             status.HTTP_400_BAD_REQUEST,
             "Empty payload rejected.",
             "rejected",
-            "Request rejected",
-            {"reason": "empty_body", "source_ip": source_ip, "webhook": webhook_reference},
         )
 
-    content_type = request.headers.get("content-type", "").strip()
-    if len(content_type) > state.config.max_content_type_length:
-        return await reject_request(
-            state,
-            status.HTTP_400_BAD_REQUEST,
-            "Content-Type header too large.",
-            "rejected",
-            "Request rejected",
-            {"reason": "content_type_too_large", "source_ip": source_ip, "webhook": webhook_reference},
+    try:
+        content_type = validate_content_type(
+            request.headers.get("content-type", ""),
+            state.config.max_content_type_length,
         )
+    except HTTPException as exc:
+        return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
 
     normalized_content_type = normalize_content_type(content_type)
-
     if normalized_content_type in {"application/json", "text/json"} or (not normalized_content_type and looks_like_json(body)):
         try:
             json.loads(body)
-        except Exception:
+        except (ValueError, TypeError):
             return await reject_request(
                 state,
                 status.HTTP_400_BAD_REQUEST,
                 "Malformed JSON payload rejected.",
                 "rejected",
-                "Request rejected",
-                {"reason": "malformed_json", "source_ip": source_ip, "webhook": webhook_reference},
             )
         if not content_type:
             content_type = "application/json"
@@ -2540,52 +3561,41 @@ async def proxy_webhook(
     if not content_type:
         content_type = "application/octet-stream"
 
-    idempotency_key_value = request.headers.get("x-idempotency-key") or request.headers.get("idempotency-key")
-    if idempotency_key_value and len(idempotency_key_value) > state.config.max_idempotency_key_length:
-        return await reject_request(
-            state,
-            status.HTTP_400_BAD_REQUEST,
-            "Idempotency key too large.",
-            "rejected",
-            "Request rejected",
-            {"reason": "idempotency_key_too_large", "source_ip": source_ip, "webhook": webhook_reference},
-        )
+    target_context = derive_target_context(thread_id, normalize_content_type(content_type), body)
+    target_key_value = target_key(webhook_key_value, target_context)
 
     try:
         enqueue_result = await state.enqueue_job(
             webhook_id=webhook_id,
             webhook_token=webhook_token,
+            webhook_key_value=webhook_key_value,
+            target_key_value=target_key_value,
+            target_context=target_context,
             query_string=query_string,
             body=body,
             content_type=content_type,
-            source_ip=source_ip,
+            priority=priority,
             idempotency_key_value=idempotency_key_value,
         )
     except HTTPException as exc:
+        return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
+    except RedisError:
         return await reject_request(
             state,
-            exc.status_code,
-            str(exc.detail),
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Queue storage is temporarily unavailable.",
             "rejected",
-            "Request rejected",
-            {"reason": "idempotency_conflict", "source_ip": source_ip, "webhook": webhook_reference},
+            1,
         )
 
-    state.logger.info(
-        "Webhook accepted",
-        extra={
-            "details": {
-                "request_id": enqueue_result["request_id"],
-                "job_id": enqueue_result["job_id"],
-                "duplicate": str(enqueue_result["duplicate"]).lower(),
-                "source_ip": source_ip,
-                "content_type": normalize_content_type(content_type),
-                "bytes": len(body),
-                "webhook": webhook_reference,
-                "idempotency": "present" if idempotency_key_value else "absent",
-            }
-        },
-    )
+    if enqueue_result["status"].endswith("_overloaded"):
+        return await reject_request(
+            state,
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            overload_message(enqueue_result["status"]),
+            "rejected",
+            state.config.overload_retry_after_seconds,
+        )
 
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
@@ -2593,10 +3603,12 @@ async def proxy_webhook(
             "message": "Accepted",
             "request_id": enqueue_result["request_id"],
             "duplicate": enqueue_result["duplicate"],
+            "priority": priority,
+            "target_context": target_context,
         },
     )
+
 
 @app.get("/{full_path:path}", response_class=RedirectResponse, include_in_schema=False)
 async def redirect_unknown_get(full_path: str) -> RedirectResponse:
     return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
-
