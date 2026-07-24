@@ -2,7 +2,7 @@ import asyncio
 import base64
 import hashlib
 import json
-import logging
+import math
 import os
 import re
 import secrets
@@ -21,9 +21,12 @@ import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from redis.exceptions import RedisError
+from starlette.requests import ClientDisconnect
 
 WEBHOOK_PATH_RE = re.compile(r"^/api/webhooks/(\d+)/([A-Za-z0-9_-]+)$")
+WEBHOOK_URL_SECRET_RE = re.compile(r"https?://(?:discord(?:app)?\.com)/api/webhooks/\d+/[A-Za-z0-9_-]+", re.IGNORECASE)
 FAVICON_PATH = Path(__file__).with_name("favicon.png")
+FAVICON_BYTES = FAVICON_PATH.read_bytes() if FAVICON_PATH.is_file() else b""
 
 INDEX_HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -923,24 +926,27 @@ INDEX_HTML_TEMPLATE = r"""
         }
 
         function convertWebhook() {
+            let original;
             try {
-                const original = new URL(input.value.trim());
-                if (original.protocol !== "https:" || !isDiscordHostname(original.hostname)) {
-                    throw new Error("Invalid host");
-                }
-                if (!/^\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+$/.test(original.pathname)) {
-                    throw new Error("Invalid path");
-                }
-
-                const proxy = new URL(window.location.origin);
-                proxy.pathname = original.pathname;
-                proxy.search = original.search;
-                output.value = proxy.toString();
-                error.classList.remove("visible");
+                original = new URL(input.value.trim());
             } catch (_) {
                 output.value = "";
                 error.classList.add("visible");
+                return;
             }
+            const validHost = original.protocol === "https:" && isDiscordHostname(original.hostname);
+            const validPath = /^\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+$/.test(original.pathname);
+            if (!validHost || !validPath) {
+                output.value = "";
+                error.classList.add("visible");
+                return;
+            }
+
+            const proxy = new URL(window.location.origin);
+            proxy.pathname = original.pathname;
+            proxy.search = original.search;
+            output.value = proxy.toString();
+            error.classList.remove("visible");
         }
 
         async function copyToClipboard() {
@@ -948,11 +954,15 @@ INDEX_HTML_TEMPLATE = r"""
                 return;
             }
 
-            if (navigator.clipboard && window.isSecureContext) {
-                await navigator.clipboard.writeText(output.value);
-            } else {
-                output.select();
-                document.execCommand("copy");
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(output.value);
+                } else {
+                    output.select();
+                    document.execCommand("copy");
+                }
+            } catch (_) {
+                return;
             }
 
             const oldText = copyButton.textContent;
@@ -1007,6 +1017,7 @@ local global_backoff_key = KEYS[4]
 local global_dispatch_window_key = KEYS[5]
 local pending_jobs_key = KEYS[6]
 local pending_bytes_key = KEYS[7]
+local maintenance_lock_key = KEYS[8]
 
 local now_ms = tonumber(ARGV[1])
 local scan_limit = tonumber(ARGV[2])
@@ -1094,8 +1105,16 @@ local function promote_head(target_key)
     return nil
 end
 
-if redis.call('EXISTS', global_backoff_key) == 1 then
+if redis.call('EXISTS', maintenance_lock_key) == 1 then
     return {}
+end
+
+local global_backoff_ms = redis.call('PTTL', global_backoff_key)
+if global_backoff_ms and global_backoff_ms > 0 then
+    return {}
+end
+if global_backoff_ms == -1 then
+    redis.call('DEL', global_backoff_key)
 end
 
 local due_targets = redis.call('ZRANGEBYSCORE', ready_key, '-inf', now_ms, 'LIMIT', 0, scan_limit)
@@ -1155,6 +1174,8 @@ for _, target_key in ipairs(due_targets) do
                         redis.call('DEL', lock_key)
                         redis.call('ZADD', ready_key, now_ms + contention_delay_ms, target_key)
                     end
+                else
+                    redis.call('ZADD', ready_key, now_ms + contention_delay_ms, target_key)
                 end
             end
         end
@@ -1574,6 +1595,14 @@ local burst_multiplier = tonumber(ARGV[7])
 local global_limit = tonumber(ARGV[8])
 local global_window_seconds = tonumber(ARGV[9])
 
+local block_ttl = redis.call('TTL', block_key)
+if block_ttl and block_ttl > 0 then
+    return {0, block_ttl, 1, 0, limit}
+end
+if block_ttl == -1 then
+    redis.call('DEL', block_key)
+end
+
 local global_count = redis.call('INCR', global_window_key)
 if global_count == 1 then
     redis.call('EXPIRE', global_window_key, global_window_seconds)
@@ -1585,11 +1614,6 @@ if global_count > global_limit then
         redis.call('EXPIRE', global_window_key, global_window_seconds)
     end
     return {0, global_ttl, 0, global_count, global_limit}
-end
-
-local block_ttl = redis.call('TTL', block_key)
-if block_ttl and block_ttl > 0 then
-    return {0, block_ttl, 1, 0, limit}
 end
 
 local count = redis.call('INCR', window_key)
@@ -1657,6 +1681,7 @@ local unique_hll_key = KEYS[9]
 local stats_key = KEYS[10]
 local idem_key = KEYS[11]
 local idem_index_key = KEYS[12]
+local maintenance_lock_key = KEYS[13]
 
 local job_id = ARGV[1]
 local request_id = ARGV[2]
@@ -1686,6 +1711,10 @@ local absolute_limit = tonumber(ARGV[25])
 local absolute_bytes_limit = tonumber(ARGV[26])
 local idempotency_max_entries = tonumber(ARGV[27])
 local idempotency_cleanup_limit = tonumber(ARGV[28])
+
+if redis.call('EXISTS', maintenance_lock_key) == 1 then
+    return {'maintenance', request_id, job_id, '0', '0'}
+end
 
 if idempotency_value ~= '' then
     local expired_idempotency_keys = redis.call(
@@ -1981,9 +2010,10 @@ def get_int_env(name: str, default: int, legacy_names: tuple[str, ...] = ()) -> 
 
 def get_float_env(name: str, default: float, legacy_names: tuple[str, ...] = ()) -> float:
     try:
-        return float(env_value(name, str(default), legacy_names))
+        value = float(env_value(name, str(default), legacy_names))
     except ValueError:
         return default
+    return value if math.isfinite(value) else default
 
 
 def get_csv_float_env(name: str, default: tuple[float, ...], legacy_names: tuple[str, ...] = ()) -> tuple[float, ...]:
@@ -1994,13 +2024,20 @@ def get_csv_float_env(name: str, default: tuple[float, ...], legacy_names: tuple
             parsed = float(item.strip())
         except ValueError:
             continue
-        if parsed >= 0:
+        if math.isfinite(parsed) and parsed >= 0:
             values.append(parsed)
     return tuple(values) or default
 
 
 def csv_items(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def validate_queue_prefix(value: str) -> str:
+    prefix = value.strip() or "discord_proxy"
+    if len(prefix) > 64 or re.fullmatch(r"[A-Za-z0-9_.:-]+", prefix) is None:
+        raise RuntimeError("QueuePrefix must contain only letters, digits, periods, underscores, colons, or hyphens.")
+    return prefix
 
 
 def is_discord_hostname(hostname: str) -> bool:
@@ -2034,7 +2071,7 @@ class Config:
         self.redis_url = env_value("RedisUrl", "", ("REDIS_URL",)).strip()
         self.api_key = env_value("ApiKey", "", ("API_KEY",)).strip()
         self.port = max(1, get_int_env("Port", 8000, ("PORT",)))
-        self.queue_prefix = env_value("QueuePrefix", "discord_proxy", ("QUEUE_PREFIX",)).strip() or "discord_proxy"
+        self.queue_prefix = validate_queue_prefix(env_value("QueuePrefix", "discord_proxy", ("QUEUE_PREFIX",)))
         self.dispatch_concurrency = max(1, get_int_env("DispatchConcurrency", 8, ("DISPATCH_CONCURRENCY",)))
         self.queue_scan_limit = max(1, get_int_env("QueueScanLimit", 64, ("QUEUE_SCAN_LIMIT",)))
         self.stale_cleanup_limit = max(1, min(256, get_int_env("StaleCleanupLimit", 16, ("STALE_CLEANUP_LIMIT",))))
@@ -2048,6 +2085,8 @@ class Config:
         self.redis_health_check_interval_seconds = max(5, get_int_env("RedisHealthCheckIntervalSeconds", 15, ("REDIS_HEALTH_CHECK_INTERVAL_SECONDS",)))
         self.redis_socket_connect_timeout_seconds = max(1.0, get_float_env("RedisSocketConnectTimeoutSeconds", 5.0, ("REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS",)))
         self.redis_socket_timeout_seconds = max(2.0, get_float_env("RedisSocketTimeoutSeconds", 30.0, ("REDIS_SOCKET_TIMEOUT_SECONDS",)))
+        self.redis_max_connections = max(16, min(256, get_int_env("RedisMaxConnections", 96, ("REDIS_MAX_CONNECTIONS",))))
+        self.redis_pool_timeout_seconds = max(0.1, get_float_env("RedisPoolTimeoutSeconds", 2.0, ("REDIS_POOL_TIMEOUT_SECONDS",)))
         self.max_retries = max(0, get_int_env("MaxRetries", 4, ("MAX_RETRIES", "MAX_ATTEMPTS")))
         self.retry_backoff_multiplier = max(1.0, get_float_env("RetryBackoffMultiplier", 2.0, ("RETRY_BACKOFF_MULTIPLIER",)))
         self.retry_schedule_seconds = get_csv_float_env("RetryScheduleSeconds", (1.0, 5.0, 30.0, 300.0), ("RETRY_SCHEDULE_SECONDS",))
@@ -2061,6 +2100,8 @@ class Config:
         self.deadletter_payload_max_bytes = max(0, get_int_env("DeadletterPayloadMaxBytes", 262144, ("DEADLETTER_PAYLOAD_MAX_BYTES",)))
         self.deadletter_bytes_limit = max(1048576, get_int_env("DeadletterBytesLimit", 134217728, ("DEADLETTER_BYTES_LIMIT",)))
         self.max_body_bytes = max(1024, get_int_env("MaxBodyBytes", 32 * 1024 * 1024, ("MAX_BODY_BYTES",)))
+        self.ingress_body_budget_bytes = max(self.max_body_bytes, get_int_env("IngressBodyBudgetBytes", 64 * 1024 * 1024, ("INGRESS_BODY_BUDGET_BYTES",)))
+        self.request_body_timeout_seconds = max(0.1, get_float_env("RequestBodyTimeoutSeconds", 30.0, ("REQUEST_BODY_TIMEOUT_SECONDS",)))
         self.storage_overhead_bytes = max(1024, get_int_env("StorageOverheadBytes", 2048, ("STORAGE_OVERHEAD_BYTES",)))
         self.max_query_length = max(256, get_int_env("MaxQueryLength", 8192, ("MAX_QUERY_LENGTH",)))
         self.max_query_fields = max(1, get_int_env("MaxQueryFields", 64, ("MAX_QUERY_FIELDS",)))
@@ -2068,8 +2109,11 @@ class Config:
         self.max_content_type_length = max(32, get_int_env("MaxContentTypeLength", 200, ("MAX_CONTENT_TYPE_LENGTH",)))
         self.ingress_concurrency = max(1, get_int_env("IngressConcurrency", 64, ("INGRESS_CONCURRENCY",)))
         self.ingress_wait_seconds = max(0.001, get_float_env("IngressWaitSeconds", 0.05, ("INGRESS_WAIT_SECONDS",)))
-        self.http_max_keepalive_connections = max(10, get_int_env("HttpMaxKeepaliveConnections", 200, ("HTTP_MAX_KEEPALIVE_CONNECTIONS",)))
-        self.http_max_connections = max(self.http_max_keepalive_connections, get_int_env("HttpMaxConnections", 400, ("HTTP_MAX_CONNECTIONS",)))
+        default_keepalive_connections = max(10, self.dispatch_concurrency * 2)
+        self.http_max_keepalive_connections = max(10, get_int_env("HttpMaxKeepaliveConnections", default_keepalive_connections, ("HTTP_MAX_KEEPALIVE_CONNECTIONS",)))
+        default_http_connections = max(self.http_max_keepalive_connections, self.dispatch_concurrency * 4)
+        self.http_max_connections = max(self.http_max_keepalive_connections, get_int_env("HttpMaxConnections", default_http_connections, ("HTTP_MAX_CONNECTIONS",)))
+        self.http_pool_timeout_seconds = max(0.1, get_float_env("HttpPoolTimeoutSeconds", 5.0, ("HTTP_POOL_TIMEOUT_SECONDS",)))
         self.target_queue_limit = max(1, get_int_env("TargetQueueLimit", 1000, ("TARGET_QUEUE_LIMIT",)))
         self.webhook_queue_limit = max(1, get_int_env("WebhookQueueLimit", 1000, ("WEBHOOK_QUEUE_LIMIT",)))
         self.global_queue_limit = max(1, get_int_env("GlobalQueueLimit", 100000, ("GLOBAL_QUEUE_LIMIT",)))
@@ -2092,50 +2136,14 @@ class Config:
         self.webhook_abuse_max_block_seconds = min(3600, max(self.webhook_abuse_base_block_seconds, get_int_env("WebhookAbuseMaxBlockSeconds", 3600, ("WEBHOOK_ABUSE_MAX_BLOCK_SECONDS",))))
         self.webhook_abuse_burst_multiplier = max(1.0, get_float_env("WebhookAbuseBurstMultiplier", 2.0, ("WEBHOOK_ABUSE_BURST_MULTIPLIER",)))
         self.rate_limit_violation_ttl_seconds = max(60, get_int_env("RateLimitViolationTtlSeconds", 3600, ("RATE_LIMIT_VIOLATION_TTL_SECONDS",)))
-        self.log_level = env_value("LogLevel", "WARNING", ("LOG_LEVEL",)).strip().upper() or "WARNING"
+        self.worker_fault_backoff_max_seconds = max(0.25, get_float_env("WorkerFaultBackoffMaxSeconds", 5.0, ("WORKER_FAULT_BACKOFF_MAX_SECONDS",)))
         webhook_blacklist_raw = env_value("BlacklistedWebhooks", "", ("BLACKLISTED_WEBHOOKS",))
         self.blacklisted_webhook_keys, self.invalid_blacklisted_webhooks = parse_blacklisted_webhooks(webhook_blacklist_raw)
 
+        if self.invalid_blacklisted_webhooks:
+            raise RuntimeError("BlacklistedWebhooks contains one or more invalid entries.")
         if not self.redis_url:
             raise RuntimeError("RedisUrl is required for durable replica-safe dispatching.")
-
-
-class PrettyLogFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-        details = getattr(record, "details", {}) or {}
-        if not isinstance(details, dict):
-            details = {"details": details}
-        rendered = " ".join(f"{key}={self._stringify(value)}" for key, value in details.items() if value is not None)
-        return f"{timestamp} | {record.levelname.title()} | {record.getMessage()}" + (f" | {rendered}" if rendered else "")
-
-    def _stringify(self, value: Any) -> str:
-        if isinstance(value, float):
-            value = round(value, 3)
-        text = str(value)
-        if any(character.isspace() for character in text):
-            return json.dumps(text, ensure_ascii=False)
-        return text
-
-
-def configure_logging(log_level: str) -> logging.Logger:
-    logger = logging.getLogger("discord_proxy")
-    level = getattr(logging, log_level, logging.WARNING)
-    logger.setLevel(level)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(PrettyLogFormatter())
-        logger.addHandler(handler)
-    logger.propagate = False
-    logging.getLogger("uvicorn.access").disabled = True
-    logging.getLogger("httpx").setLevel(logging.CRITICAL)
-    logging.getLogger("httpcore").setLevel(logging.CRITICAL)
-    logging.getLogger("redis").setLevel(logging.CRITICAL)
-    return logger
-
-
-def log_event(logger: logging.Logger, level: int, message: str, details: dict[str, Any] | None = None) -> None:
-    logger.log(level, message, extra={"details": details or {}})
 
 
 def now_ms() -> int:
@@ -2190,25 +2198,35 @@ def looks_like_json(body: bytes) -> bool:
     return stripped.startswith(b"{") or stripped.startswith(b"[")
 
 
-def parse_retry_after_header(value: str) -> float | None:
+def finite_nonnegative_float(value: Any, maximum: float = 86400.0) -> float | None:
     try:
-        return max(float(value), 0.0)
-    except ValueError:
-        try:
-            parsed = parsedate_to_datetime(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return max((parsed - datetime.now(timezone.utc)).total_seconds(), 0.0)
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return min(max(parsed, 0.0), maximum)
+
+
+def parse_retry_after_header(value: str) -> float | None:
+    numeric = finite_nonnegative_float(value)
+    if numeric is not None:
+        return numeric
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return finite_nonnegative_float((parsed - datetime.now(timezone.utc)).total_seconds())
 
 
 def get_retry_after_seconds(response: httpx.Response) -> float:
     try:
         payload = response.json()
-        retry_after = payload.get("retry_after")
+        retry_after = finite_nonnegative_float(payload.get("retry_after"))
         if retry_after is not None:
-            return max(float(retry_after), 0.0)
+            return retry_after
     except (ValueError, TypeError, AttributeError):
         pass
 
@@ -2218,32 +2236,17 @@ def get_retry_after_seconds(response: httpx.Response) -> float:
         if parsed_header is not None:
             return parsed_header
 
-    reset_after = response.headers.get("X-RateLimit-Reset-After")
-    if reset_after:
-        try:
-            return max(float(reset_after), 0.0)
-        except ValueError:
-            pass
-
+    reset_after = finite_nonnegative_float(response.headers.get("X-RateLimit-Reset-After"))
+    if reset_after is not None:
+        return reset_after
     return 1.0
 
 
 def get_bucket_reset_after_seconds(response: httpx.Response) -> float | None:
-    remaining = response.headers.get("X-RateLimit-Remaining")
-    if remaining is None:
+    remaining = finite_nonnegative_float(response.headers.get("X-RateLimit-Remaining"))
+    if remaining is None or remaining > 0:
         return None
-    try:
-        if int(float(remaining)) > 0:
-            return None
-    except ValueError:
-        return None
-    reset_after = response.headers.get("X-RateLimit-Reset-After")
-    if not reset_after:
-        return None
-    try:
-        return max(float(reset_after), 0.0)
-    except ValueError:
-        return None
+    return finite_nonnegative_float(response.headers.get("X-RateLimit-Reset-After"))
 
 
 def is_global_rate_limited(response: httpx.Response) -> bool:
@@ -2263,6 +2266,10 @@ def truncate_text(value: str, limit: int = 240) -> str:
     return value[: limit - 1] + "…"
 
 
+def redact_sensitive_text(value: str, limit: int = 500) -> str:
+    return truncate_text(WEBHOOK_URL_SECRET_RE.sub("[redacted-webhook-url]", value), limit)
+
+
 def retry_delay_seconds(failure_number: int, config: Config, server_retry_after: float | None = None) -> float:
     index = max(failure_number - 1, 0)
     if index < len(config.retry_schedule_seconds):
@@ -2273,8 +2280,7 @@ def retry_delay_seconds(failure_number: int, config: Config, server_retry_after:
     delay = min(delay, config.max_retry_delay_seconds)
     if server_retry_after is not None:
         delay = max(delay, server_retry_after)
-    jitter_seed = (failure_number * 9301 + 49297) % 233280
-    jitter = (jitter_seed / 233280.0) * 0.25
+    jitter = secrets.randbelow(250000) / 1000000.0
     return delay + jitter
 
 
@@ -2388,32 +2394,66 @@ def parse_queue_entry(entry: str, fallback_webhook_key: str = "") -> tuple[str, 
     return parts[0], max(charge, 0), webhook_key_value
 
 
-async def read_limited_body(request: Request, max_bytes: int) -> bytes:
-    content_length = request.headers.get("content-length")
-    if content_length:
+async def read_limited_body(request: Request, max_bytes: int, timeout_seconds: float) -> bytes:
+    content_lengths = request.headers.getlist("content-length")
+    if len(content_lengths) > 1:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Content-Length may be provided only once.")
+    if content_lengths:
         try:
-            if int(content_length) > max_bytes:
-                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Payload too large.")
+            content_length = int(content_lengths[0])
         except ValueError:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Content-Length header.")
+        if content_length < 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Content-Length header.")
+        if content_length > max_bytes:
+            raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Payload too large.")
 
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > max_bytes:
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Payload too large.")
-        chunks.append(chunk)
-    return b"".join(chunks)
+    body = bytearray()
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > max_bytes:
+                    raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Payload too large.")
+                body.extend(chunk)
+    except TimeoutError:
+        raise HTTPException(status_code=status.HTTP_408_REQUEST_TIMEOUT, detail="Request body timed out.")
+    except ClientDisconnect:
+        raise HTTPException(status_code=499, detail="Client disconnected before the request body completed.")
+    return bytes(body)
+
+
+class AsyncByteBudget:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.available = capacity
+        self.condition = asyncio.Condition()
+
+    async def acquire(self, amount: int, timeout_seconds: float) -> bool:
+        requested = max(0, min(amount, self.capacity))
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                async with self.condition:
+                    await self.condition.wait_for(lambda: self.available >= requested)
+                    self.available -= requested
+                    return True
+        except TimeoutError:
+            return False
+
+    async def release(self, amount: int) -> None:
+        released = max(0, min(amount, self.capacity))
+        async with self.condition:
+            self.available = min(self.capacity, self.available + released)
+            self.condition.notify_all()
 
 
 class AppState:
-    def __init__(self, config: Config, logger: logging.Logger) -> None:
+    def __init__(self, config: Config) -> None:
         self.config = config
-        self.logger = logger
         self.instance_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-        self.redis = redis.from_url(
+        pool = redis.BlockingConnectionPool.from_url(
             config.redis_url,
+            max_connections=config.redis_max_connections,
+            timeout=config.redis_pool_timeout_seconds,
             encoding="utf-8",
             decode_responses=True,
             health_check_interval=config.redis_health_check_interval_seconds,
@@ -2421,17 +2461,33 @@ class AppState:
             socket_timeout=config.redis_socket_timeout_seconds,
             socket_keepalive=True,
         )
+        self.redis = redis.Redis.from_pool(pool)
+        self.set_max_backoff_script = self.redis.register_script(SET_MAX_BACKOFF_LUA)
+        self.record_invalid_request_script = self.redis.register_script(RECORD_INVALID_REQUEST_LUA)
+        self.rate_limit_script = self.redis.register_script(RATE_LIMIT_LUA)
+        self.claim_next_job_script = self.redis.register_script(CLAIM_NEXT_JOB_LUA)
+        self.finalize_job_script = self.redis.register_script(FINALIZE_JOB_LUA)
+        self.reschedule_job_script = self.redis.register_script(RESCHEDULE_JOB_LUA)
+        self.enqueue_job_script = self.redis.register_script(ENQUEUE_JOB_LUA)
+        self.push_deadletter_script = self.redis.register_script(PUSH_DEADLETTER_LUA)
+        self.reclaim_job_script = self.redis.register_script(RECLAIM_JOB_LUA)
         self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(config.http_timeout_seconds, connect=5.0),
+            timeout=httpx.Timeout(
+                config.http_timeout_seconds,
+                connect=5.0,
+                pool=config.http_pool_timeout_seconds,
+            ),
             limits=httpx.Limits(
                 max_keepalive_connections=config.http_max_keepalive_connections,
                 max_connections=config.http_max_connections,
             ),
             follow_redirects=False,
+            trust_env=False,
         )
         self.shutdown_event = asyncio.Event()
         self.tasks: list[asyncio.Task[Any]] = []
         self.ingress_slots = asyncio.Semaphore(config.ingress_concurrency)
+        self.ingress_body_budget = AsyncByteBudget(config.ingress_body_budget_bytes)
 
     @property
     def ready_targets_key(self) -> str:
@@ -2476,6 +2532,10 @@ class AppState:
     @property
     def idempotency_index_key(self) -> str:
         return f"{self.config.queue_prefix}:idempotency:index"
+
+    @property
+    def maintenance_lock_key(self) -> str:
+        return f"{self.config.queue_prefix}:control:maintenance"
 
     @property
     def global_backoff_key(self) -> str:
@@ -2534,19 +2594,6 @@ class AppState:
         for index in range(self.config.dispatch_concurrency):
             self.tasks.append(asyncio.create_task(self.worker_loop(index), name=f"worker-{index}"))
         self.tasks.append(asyncio.create_task(self.reclaim_loop(), name="reclaimer"))
-        log_event(
-            self.logger,
-            logging.INFO,
-            "Service ready",
-            {
-                "instance": self.instance_id,
-                "dispatch_concurrency": self.config.dispatch_concurrency,
-                "queue_prefix": self.config.queue_prefix,
-                "blacklisted_webhooks": len(self.config.blacklisted_webhook_keys),
-            },
-        )
-        for invalid in self.config.invalid_blacklisted_webhooks:
-            log_event(self.logger, logging.WARNING, "Invalid blacklisted webhook ignored", {"entry_hash": short_hash(invalid)})
 
     async def stop(self) -> None:
         self.shutdown_event.set()
@@ -2555,7 +2602,10 @@ class AppState:
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.http_client.aclose()
         await self.redis.aclose()
-        log_event(self.logger, logging.INFO, "Service stopped", {"instance": self.instance_id})
+
+    def background_tasks_healthy(self) -> bool:
+        expected = self.config.dispatch_concurrency + 1
+        return len(self.tasks) == expected and all(not task.done() for task in self.tasks)
 
     async def increment_stat(self, field: str, amount: int = 1) -> None:
         try:
@@ -2565,7 +2615,7 @@ class AppState:
 
     async def set_max_backoff(self, key: str, delay_seconds: float) -> None:
         ttl_ms = max(1, int((delay_seconds + 0.25) * 1000))
-        await self.redis.eval(SET_MAX_BACKOFF_LUA, 1, key, str(ttl_ms))
+        await self.set_max_backoff_script(keys=[key], args=[str(ttl_ms)])
 
     async def set_global_backoff(self, delay_seconds: float) -> None:
         await self.set_max_backoff(self.global_backoff_key, delay_seconds)
@@ -2575,42 +2625,51 @@ class AppState:
 
     async def record_invalid_request(self) -> None:
         try:
-            await self.redis.eval(
-                RECORD_INVALID_REQUEST_LUA,
-                3,
-                self.invalid_request_window_key,
-                self.global_backoff_key,
-                self.stats_key,
-                str(self.config.discord_invalid_request_limit),
-                str(self.config.discord_invalid_request_window_seconds * 1000),
+            await self.record_invalid_request_script(
+                keys=[
+                    self.invalid_request_window_key,
+                    self.global_backoff_key,
+                    self.stats_key,
+                ],
+                args=[
+                    str(self.config.discord_invalid_request_limit),
+                    str(self.config.discord_invalid_request_window_seconds * 1000),
+                ],
             )
         except RedisError:
             return
 
     async def sleep_if_global_backoff(self) -> bool:
         ttl_ms = await self.redis.pttl(self.global_backoff_key)
-        if ttl_ms and ttl_ms > 0:
+        if ttl_ms > 0:
             await asyncio.sleep(min(ttl_ms / 1000.0, self.config.poll_interval_seconds))
             return True
+        if ttl_ms == -1:
+            await self.redis.delete(self.global_backoff_key)
         return False
 
+    async def is_maintenance_active(self) -> bool:
+        return bool(await self.redis.exists(self.maintenance_lock_key))
+
     async def check_rate_limit(self, subject_key: str) -> dict[str, Any]:
-        result = await self.redis.eval(
-            RATE_LIMIT_LUA,
-            4,
-            self.rate_limit_key(subject_key, "window"),
-            self.rate_limit_key(subject_key, "violations"),
-            self.rate_limit_key(subject_key, "block"),
-            self.global_ingress_rate_limit_key,
-            str(self.config.webhook_rate_limit_requests),
-            str(self.config.webhook_rate_limit_window_seconds),
-            str(self.config.rate_limit_violation_ttl_seconds),
-            str(self.config.webhook_abuse_block_after),
-            str(self.config.webhook_abuse_base_block_seconds),
-            str(self.config.webhook_abuse_max_block_seconds),
-            str(self.config.webhook_abuse_burst_multiplier),
-            str(self.config.global_ingress_rate_limit_requests),
-            str(self.config.global_ingress_rate_limit_window_seconds),
+        result = await self.rate_limit_script(
+            keys=[
+                self.rate_limit_key(subject_key, "window"),
+                self.rate_limit_key(subject_key, "violations"),
+                self.rate_limit_key(subject_key, "block"),
+                self.global_ingress_rate_limit_key,
+            ],
+            args=[
+                str(self.config.webhook_rate_limit_requests),
+                str(self.config.webhook_rate_limit_window_seconds),
+                str(self.config.rate_limit_violation_ttl_seconds),
+                str(self.config.webhook_abuse_block_after),
+                str(self.config.webhook_abuse_base_block_seconds),
+                str(self.config.webhook_abuse_max_block_seconds),
+                str(self.config.webhook_abuse_burst_multiplier),
+                str(self.config.global_ingress_rate_limit_requests),
+                str(self.config.global_ingress_rate_limit_window_seconds),
+            ],
         )
         allowed, retry_after, blocked, count, limit = result
         return {
@@ -2662,33 +2721,36 @@ class AppState:
 
     async def claim_next_job(self) -> tuple[str, str, str, str, str] | None:
         claim_token = uuid.uuid4().hex
-        result = await self.redis.eval(
-            CLAIM_NEXT_JOB_LUA,
-            7,
-            self.ready_targets_key,
-            self.processing_jobs_key,
-            self.processing_meta_key,
-            self.global_backoff_key,
-            self.global_dispatch_window_key,
-            self.pending_jobs_key,
-            self.pending_bytes_key,
-            str(now_ms()),
-            str(self.config.queue_scan_limit),
-            self.instance_id,
-            str(int(self.config.claim_visibility_seconds * 1000)),
-            f"{self.config.queue_prefix}:webhook-queue:",
-            f"{self.config.queue_prefix}:job:",
-            f"{self.config.queue_prefix}:claim:",
-            f"{self.config.queue_prefix}:lock:",
-            f"{self.config.queue_prefix}:discord:webhook-lock:",
-            f"{self.config.queue_prefix}:discord:webhook-backoff:",
-            f"{self.config.queue_prefix}:pending:webhook-jobs:",
-            f"{self.config.queue_prefix}:pending:webhook-bytes:",
-            f"{self.config.queue_prefix}:pending:target-bytes:",
-            str(self.config.stale_cleanup_limit),
-            str(self.config.discord_global_requests_per_second),
-            claim_token,
-            str(max(25, int(self.config.poll_interval_seconds * 1000))),
+        result = await self.claim_next_job_script(
+            keys=[
+                self.ready_targets_key,
+                self.processing_jobs_key,
+                self.processing_meta_key,
+                self.global_backoff_key,
+                self.global_dispatch_window_key,
+                self.pending_jobs_key,
+                self.pending_bytes_key,
+                self.maintenance_lock_key,
+            ],
+            args=[
+                str(now_ms()),
+                str(self.config.queue_scan_limit),
+                self.instance_id,
+                str(int(self.config.claim_visibility_seconds * 1000)),
+                f"{self.config.queue_prefix}:webhook-queue:",
+                f"{self.config.queue_prefix}:job:",
+                f"{self.config.queue_prefix}:claim:",
+                f"{self.config.queue_prefix}:lock:",
+                f"{self.config.queue_prefix}:discord:webhook-lock:",
+                f"{self.config.queue_prefix}:discord:webhook-backoff:",
+                f"{self.config.queue_prefix}:pending:webhook-jobs:",
+                f"{self.config.queue_prefix}:pending:webhook-bytes:",
+                f"{self.config.queue_prefix}:pending:target-bytes:",
+                str(self.config.stale_cleanup_limit),
+                str(self.config.discord_global_requests_per_second),
+                claim_token,
+                str(max(25, int(self.config.poll_interval_seconds * 1000))),
+            ],
         )
         if not result:
             return None
@@ -2704,37 +2766,39 @@ class AppState:
         claim_token: str,
         delete_job: bool = True,
     ) -> str:
-        result = await self.redis.eval(
-            FINALIZE_JOB_LUA,
-            13,
-            self.ready_targets_key,
-            self.processing_jobs_key,
-            self.processing_meta_key,
-            self.pending_jobs_key,
-            self.pending_bytes_key,
-            self.job_key(job_id),
-            self.target_queue_key(target_key_value),
-            self.claim_key(job_id),
-            self.lock_key(target_key_value),
-            self.webhook_pending_key(webhook_key_value),
-            self.webhook_bytes_key(webhook_key_value),
-            self.target_bytes_key(target_key_value),
-            self.webhook_lock_key(webhook_key_value),
-            job_id,
-            target_key_value,
-            queue_entry,
-            webhook_key_value,
-            claim_token,
-            "1" if delete_job else "0",
-            f"{self.config.queue_prefix}:job:",
-            f"{self.config.queue_prefix}:webhook-queue:",
-            f"{self.config.queue_prefix}:claim:",
-            f"{self.config.queue_prefix}:lock:",
-            f"{self.config.queue_prefix}:pending:webhook-jobs:",
-            f"{self.config.queue_prefix}:pending:webhook-bytes:",
-            f"{self.config.queue_prefix}:pending:target-bytes:",
-            str(self.config.stale_cleanup_limit),
-            str(now_ms()),
+        result = await self.finalize_job_script(
+            keys=[
+                self.ready_targets_key,
+                self.processing_jobs_key,
+                self.processing_meta_key,
+                self.pending_jobs_key,
+                self.pending_bytes_key,
+                self.job_key(job_id),
+                self.target_queue_key(target_key_value),
+                self.claim_key(job_id),
+                self.lock_key(target_key_value),
+                self.webhook_pending_key(webhook_key_value),
+                self.webhook_bytes_key(webhook_key_value),
+                self.target_bytes_key(target_key_value),
+                self.webhook_lock_key(webhook_key_value),
+            ],
+            args=[
+                job_id,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                "1" if delete_job else "0",
+                f"{self.config.queue_prefix}:job:",
+                f"{self.config.queue_prefix}:webhook-queue:",
+                f"{self.config.queue_prefix}:claim:",
+                f"{self.config.queue_prefix}:lock:",
+                f"{self.config.queue_prefix}:pending:webhook-jobs:",
+                f"{self.config.queue_prefix}:pending:webhook-bytes:",
+                f"{self.config.queue_prefix}:pending:target-bytes:",
+                str(self.config.stale_cleanup_limit),
+                str(now_ms()),
+            ],
         )
         return str(result[0]) if result else "unknown"
 
@@ -2750,24 +2814,26 @@ class AppState:
         last_error: str,
         last_status: str,
     ) -> str:
-        result = await self.redis.eval(
-            RESCHEDULE_JOB_LUA,
-            7,
-            self.ready_targets_key,
-            self.processing_jobs_key,
-            self.processing_meta_key,
-            self.job_key(job_id),
-            self.claim_key(job_id),
-            self.lock_key(target_key_value),
-            self.webhook_lock_key(webhook_key_value),
-            job_id,
-            target_key_value,
-            str(next_available_at_ms),
-            str(attempts),
-            last_error,
-            last_status,
-            str(self.config.job_ttl_seconds),
-            claim_token,
+        result = await self.reschedule_job_script(
+            keys=[
+                self.ready_targets_key,
+                self.processing_jobs_key,
+                self.processing_meta_key,
+                self.job_key(job_id),
+                self.claim_key(job_id),
+                self.lock_key(target_key_value),
+                self.webhook_lock_key(webhook_key_value),
+            ],
+            args=[
+                job_id,
+                target_key_value,
+                str(next_available_at_ms),
+                str(attempts),
+                last_error,
+                last_status,
+                str(self.config.job_ttl_seconds),
+                claim_token,
+            ],
         )
         state = str(result[0]) if result else "unknown"
         if state == "missing":
@@ -2809,49 +2875,52 @@ class AppState:
         )
         idem_key_name = self.idempotency_key(webhook_key_value, idempotency_key_value) if idempotency_key_value else ""
 
-        result = await self.redis.eval(
-            ENQUEUE_JOB_LUA,
-            12,
-            self.job_key(job_id),
-            self.target_queue_key(target_key_value),
-            self.ready_targets_key,
-            self.pending_jobs_key,
-            self.pending_bytes_key,
-            self.webhook_pending_key(webhook_key_value),
-            self.webhook_bytes_key(webhook_key_value),
-            self.target_bytes_key(target_key_value),
-            self.unique_webhooks_hll_key,
-            self.stats_key,
-            idem_key_name,
-            self.idempotency_index_key,
-            job_id,
-            request_id,
-            webhook_id,
-            webhook_token,
-            webhook_key_value,
-            target_key_value,
-            target_context,
-            query_string,
-            body_b64,
-            content_type,
-            str(created_at_ms),
-            body_sha256,
-            request_sha256,
-            idempotency_key_value or "",
-            str(self.config.job_ttl_seconds),
-            str(self.config.idempotency_ttl_seconds),
-            str(storage_bytes),
-            "1" if priority else "0",
-            str(self.config.target_queue_limit),
-            str(self.config.webhook_queue_limit),
-            str(self.config.global_queue_limit),
-            str(self.config.target_queue_bytes_limit),
-            str(self.config.webhook_queue_bytes_limit),
-            str(self.config.global_queue_bytes_limit),
-            str(self.config.absolute_queue_limit),
-            str(self.config.absolute_queue_bytes_limit),
-            str(self.config.idempotency_max_entries),
-            str(self.config.idempotency_cleanup_limit),
+        result = await self.enqueue_job_script(
+            keys=[
+                self.job_key(job_id),
+                self.target_queue_key(target_key_value),
+                self.ready_targets_key,
+                self.pending_jobs_key,
+                self.pending_bytes_key,
+                self.webhook_pending_key(webhook_key_value),
+                self.webhook_bytes_key(webhook_key_value),
+                self.target_bytes_key(target_key_value),
+                self.unique_webhooks_hll_key,
+                self.stats_key,
+                idem_key_name,
+                self.idempotency_index_key,
+                self.maintenance_lock_key,
+            ],
+            args=[
+                job_id,
+                request_id,
+                webhook_id,
+                webhook_token,
+                webhook_key_value,
+                target_key_value,
+                target_context,
+                query_string,
+                body_b64,
+                content_type,
+                str(created_at_ms),
+                body_sha256,
+                request_sha256,
+                idempotency_key_value or "",
+                str(self.config.job_ttl_seconds),
+                str(self.config.idempotency_ttl_seconds),
+                str(storage_bytes),
+                "1" if priority else "0",
+                str(self.config.target_queue_limit),
+                str(self.config.webhook_queue_limit),
+                str(self.config.global_queue_limit),
+                str(self.config.target_queue_bytes_limit),
+                str(self.config.webhook_queue_bytes_limit),
+                str(self.config.global_queue_bytes_limit),
+                str(self.config.absolute_queue_limit),
+                str(self.config.absolute_queue_bytes_limit),
+                str(self.config.idempotency_max_entries),
+                str(self.config.idempotency_cleanup_limit),
+            ],
         )
 
         result_status = str(result[0])
@@ -2904,7 +2973,6 @@ class AppState:
             "job_id": job.get("job_id", ""),
             "request_id": job.get("request_id", ""),
             "webhook_id": job.get("webhook_id", ""),
-            "webhook_token": job.get("webhook_token", ""),
             "webhook_ref": webhook_ref(job.get("webhook_id", ""), job.get("webhook_token", "")),
             "webhook_key": job.get("webhook_key", ""),
             "target_key": job.get("target_key", job.get("webhook_key", "")),
@@ -2931,33 +2999,38 @@ class AppState:
         for key, value in fields.items():
             arguments.extend([key, value])
 
-        await self.redis.eval(
-            PUSH_DEADLETTER_LUA,
-            4,
-            self.deadletter_index_key,
-            self.deadletter_key(job["job_id"]),
-            self.stats_key,
-            self.deadletter_bytes_key,
-            str(self.config.deadletter_ttl_seconds),
-            str(self.config.deadletter_max_entries),
-            str(now_ms()),
-            f"{self.config.queue_prefix}:deadletter:",
-            "100",
-            str(len(fields)),
-            job["job_id"],
-            str(storage_bytes),
-            str(self.config.deadletter_bytes_limit),
-            *arguments,
+        await self.push_deadletter_script(
+            keys=[
+                self.deadletter_index_key,
+                self.deadletter_key(job["job_id"]),
+                self.stats_key,
+                self.deadletter_bytes_key,
+            ],
+            args=[
+                str(self.config.deadletter_ttl_seconds),
+                str(self.config.deadletter_max_entries),
+                str(now_ms()),
+                f"{self.config.queue_prefix}:deadletter:",
+                "100",
+                str(len(fields)),
+                job["job_id"],
+                str(storage_bytes),
+                str(self.config.deadletter_bytes_limit),
+                *arguments,
+            ],
         )
 
     async def worker_loop(self, worker_index: int) -> None:
+        fault_delay = self.config.poll_interval_seconds
         while not self.shutdown_event.is_set():
             try:
                 if await self.sleep_if_global_backoff():
+                    fault_delay = self.config.poll_interval_seconds
                     continue
 
                 claim = await self.claim_next_job()
                 if claim is None:
+                    fault_delay = self.config.poll_interval_seconds
                     await asyncio.sleep(self.config.poll_interval_seconds)
                     continue
 
@@ -2972,6 +3045,7 @@ class AppState:
                         claim_token,
                         delete_job=True,
                     )
+                    fault_delay = self.config.poll_interval_seconds
                     continue
 
                 await self.process_job(
@@ -2982,16 +3056,12 @@ class AppState:
                     claim_token,
                     worker_index,
                 )
+                fault_delay = self.config.poll_interval_seconds
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                log_event(
-                    self.logger,
-                    logging.ERROR,
-                    "Worker loop fault",
-                    {"worker": worker_index, "fault": truncate_text(str(exc))},
-                )
-                await asyncio.sleep(self.config.poll_interval_seconds)
+            except Exception:
+                await asyncio.sleep(fault_delay)
+                fault_delay = min(fault_delay * 2, self.config.worker_fault_backoff_max_seconds)
 
     async def process_job(
         self,
@@ -3015,7 +3085,7 @@ class AppState:
 
         headers = {
             "Content-Type": job.get("content_type", "application/json"),
-            "User-Agent": "discord-webhook-proxy/4.0",
+            "User-Agent": "discord-webhook-proxy/4.1",
         }
 
         try:
@@ -3124,7 +3194,7 @@ class AppState:
     ) -> None:
         job_id = job["job_id"]
         if attempts > self.config.max_retries:
-            response_excerpt = truncate_text(str(error_value))
+            response_excerpt = redact_sensitive_text(str(error_value))
             await self.push_deadletter(
                 job,
                 f"{reason}_max_retries_exhausted",
@@ -3144,21 +3214,24 @@ class AppState:
             claim_token=claim_token,
             next_available_at_ms=next_available_at,
             attempts=attempts,
-            last_error=truncate_text(str(error_value), 500),
+            last_error=redact_sensitive_text(str(error_value), 500),
             last_status=status_value,
         )
         if state == "rescheduled":
             await self.increment_stat("retried")
 
     async def reclaim_loop(self) -> None:
+        fault_delay = self.config.reclaim_interval_seconds
         while not self.shutdown_event.is_set():
             try:
                 await asyncio.sleep(self.config.reclaim_interval_seconds)
                 await self.reclaim_expired_jobs()
+                fault_delay = self.config.reclaim_interval_seconds
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                log_event(self.logger, logging.ERROR, "Reclaimer fault", {"fault": truncate_text(str(exc))})
+            except Exception:
+                await asyncio.sleep(fault_delay)
+                fault_delay = min(fault_delay * 2, self.config.worker_fault_backoff_max_seconds)
 
     async def reclaim_expired_jobs(self) -> None:
         expired_ids = await self.redis.zrangebyscore(
@@ -3173,27 +3246,29 @@ class AppState:
 
         reclaimed = 0
         for job_id in expired_ids:
-            result = await self.redis.eval(
-                RECLAIM_JOB_LUA,
-                7,
-                self.ready_targets_key,
-                self.processing_jobs_key,
-                self.processing_meta_key,
-                self.pending_jobs_key,
-                self.pending_bytes_key,
-                self.job_key(job_id),
-                self.claim_key(job_id),
-                job_id,
-                str(now_ms()),
-                str(self.config.job_ttl_seconds),
-                f"{self.config.queue_prefix}:webhook-queue:",
-                f"{self.config.queue_prefix}:job:",
-                f"{self.config.queue_prefix}:lock:",
-                f"{self.config.queue_prefix}:pending:webhook-jobs:",
-                f"{self.config.queue_prefix}:pending:webhook-bytes:",
-                f"{self.config.queue_prefix}:pending:target-bytes:",
-                f"{self.config.queue_prefix}:discord:webhook-lock:",
-                str(self.config.stale_cleanup_limit),
+            result = await self.reclaim_job_script(
+                keys=[
+                    self.ready_targets_key,
+                    self.processing_jobs_key,
+                    self.processing_meta_key,
+                    self.pending_jobs_key,
+                    self.pending_bytes_key,
+                    self.job_key(job_id),
+                    self.claim_key(job_id),
+                ],
+                args=[
+                    job_id,
+                    str(now_ms()),
+                    str(self.config.job_ttl_seconds),
+                    f"{self.config.queue_prefix}:webhook-queue:",
+                    f"{self.config.queue_prefix}:job:",
+                    f"{self.config.queue_prefix}:lock:",
+                    f"{self.config.queue_prefix}:pending:webhook-jobs:",
+                    f"{self.config.queue_prefix}:pending:webhook-bytes:",
+                    f"{self.config.queue_prefix}:pending:target-bytes:",
+                    f"{self.config.queue_prefix}:discord:webhook-lock:",
+                    str(self.config.stale_cleanup_limit),
+                ],
             )
             state = str(result[0]) if result else "unknown"
             if state == "reclaimed":
@@ -3213,8 +3288,7 @@ def get_state(request: Request) -> AppState:
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
     config = Config()
-    logger = configure_logging(config.log_level)
-    state = AppState(config, logger)
+    state = AppState(config)
     app_instance.state.state = state
     await state.start()
     try:
@@ -3226,9 +3300,19 @@ async def lifespan(app_instance: FastAPI):
 app = FastAPI(
     title="Discord Webhook Proxy",
     description="A queue-bounded, rate-limit-aware relay for Discord webhooks.",
-    version="4.0.0",
+    version="4.1.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, _exception: Exception) -> Response:
+    if request.url.path.startswith("/api/"):
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": "Internal service failure."},
+        )
+    return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @app.middleware("http")
@@ -3259,9 +3343,33 @@ async def ingress_capacity_middleware(request: Request, call_next):
             headers={"Retry-After": "1"},
             content={"error": "Proxy request capacity reached.", "retry_after": 1},
         )
+
+    reservation = state.config.max_body_bytes
+    content_lengths = request.headers.getlist("content-length")
+    if len(content_lengths) == 1:
+        try:
+            parsed_length = int(content_lengths[0])
+        except ValueError:
+            parsed_length = state.config.max_body_bytes
+        if parsed_length >= 0:
+            reservation = min(parsed_length, state.config.max_body_bytes)
+
+    budget_acquired = await state.ingress_body_budget.acquire(
+        reservation,
+        state.config.ingress_wait_seconds,
+    )
+    if not budget_acquired:
+        state.ingress_slots.release()
+        await state.increment_stat("ingress_rejected")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "1"},
+            content={"error": "Proxy request memory capacity reached.", "retry_after": 1},
+        )
     try:
         return await call_next(request)
     finally:
+        await state.ingress_body_budget.release(reservation)
         state.ingress_slots.release()
 
 
@@ -3288,15 +3396,15 @@ async def serve_frontend() -> HTMLResponse:
 
 @app.get("/favicon.png")
 async def favicon() -> Response:
-    if FAVICON_PATH.exists():
-        return Response(content=FAVICON_PATH.read_bytes(), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+    if FAVICON_BYTES:
+        return Response(content=FAVICON_BYTES, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/og-image.png")
 async def og_image() -> Response:
-    if FAVICON_PATH.exists():
-        return Response(content=FAVICON_PATH.read_bytes(), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+    if FAVICON_BYTES:
+        return Response(content=FAVICON_BYTES, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -3362,9 +3470,11 @@ async def healthz(request: Request) -> JSONResponse:
     state = get_state(request)
     try:
         await state.redis.ping()
-        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "ok"})
     except RedisError:
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"status": "degraded"})
+    if not state.background_tasks_healthy():
+        return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"status": "degraded"})
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "ok"})
 
 
 @app.get("/readyz")
@@ -3373,6 +3483,8 @@ async def readyz(request: Request) -> Response:
     try:
         await state.redis.ping()
     except RedisError:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    if not state.background_tasks_healthy():
         return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -3422,6 +3534,25 @@ async def proxy_webhook(
             "blocked",
         )
 
+    try:
+        maintenance_active = await state.is_maintenance_active()
+    except RedisError:
+        return await reject_request(
+            state,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Queue storage is temporarily unavailable.",
+            "rejected",
+            1,
+        )
+    if maintenance_active:
+        return await reject_request(
+            state,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Queue maintenance is in progress.",
+            "rejected",
+            1,
+        )
+
     api_key_headers = request.headers.getlist("x-api-key")
     if len(api_key_headers) > 1:
         return await reject_request(
@@ -3460,6 +3591,16 @@ async def proxy_webhook(
             "rejected",
         )
 
+    content_type_headers = request.headers.getlist("content-type")
+    if len(content_type_headers) > 1:
+        return await reject_request(
+            state,
+            status.HTTP_400_BAD_REQUEST,
+            "Content-Type may be provided only once.",
+            "rejected",
+        )
+    raw_content_type = content_type_headers[0] if content_type_headers else ""
+
     try:
         rate_limit = await state.check_rate_limit(webhook_key_value)
     except RedisError:
@@ -3481,14 +3622,21 @@ async def proxy_webhook(
             },
         )
 
-    normalized_content_type = normalize_content_type(request.headers.get("content-type", ""))
+    normalized_content_type = normalize_content_type(raw_content_type)
     preliminary_context = f"thread_id:{thread_id}" if thread_id else "webhook"
     preliminary_target_key = target_key(webhook_key_value, preliminary_context)
-    content_length = request.headers.get("content-length")
+    content_length_headers = request.headers.getlist("content-length")
+    if len(content_length_headers) > 1:
+        return await reject_request(
+            state,
+            status.HTTP_400_BAD_REQUEST,
+            "Content-Length may be provided only once.",
+            "rejected",
+        )
     estimated_request_bytes = state.config.storage_overhead_bytes
-    if content_length:
+    if content_length_headers:
         try:
-            estimated_request_bytes += max(0, int(content_length) * 4 // 3)
+            content_length = int(content_length_headers[0])
         except ValueError:
             return await reject_request(
                 state,
@@ -3496,6 +3644,21 @@ async def proxy_webhook(
                 "Invalid Content-Length header.",
                 "rejected",
             )
+        if content_length < 0:
+            return await reject_request(
+                state,
+                status.HTTP_400_BAD_REQUEST,
+                "Invalid Content-Length header.",
+                "rejected",
+            )
+        if content_length > state.config.max_body_bytes:
+            return await reject_request(
+                state,
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                "Payload too large.",
+                "rejected",
+            )
+        estimated_request_bytes += content_length * 4 // 3
 
     if not idempotency_key_value:
         try:
@@ -3524,7 +3687,11 @@ async def proxy_webhook(
             )
 
     try:
-        body = await read_limited_body(request, state.config.max_body_bytes)
+        body = await read_limited_body(
+            request,
+            state.config.max_body_bytes,
+            state.config.request_body_timeout_seconds,
+        )
     except HTTPException as exc:
         return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
 
@@ -3538,7 +3705,7 @@ async def proxy_webhook(
 
     try:
         content_type = validate_content_type(
-            request.headers.get("content-type", ""),
+            raw_content_type,
             state.config.max_content_type_length,
         )
     except HTTPException as exc:
@@ -3584,6 +3751,15 @@ async def proxy_webhook(
             state,
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Queue storage is temporarily unavailable.",
+            "rejected",
+            1,
+        )
+
+    if enqueue_result["status"] == "maintenance":
+        return await reject_request(
+            state,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Queue maintenance is in progress.",
             "rejected",
             1,
         )
