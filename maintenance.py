@@ -65,10 +65,10 @@ async def delete_keys(client: redis.Redis, keys: list[str]) -> int:
 async def audit(client: redis.Redis, prefix: str, top: int) -> dict[str, Any]:
     queue_prefix = f"{prefix}:webhook-queue:"
     job_prefix = f"{prefix}:job:"
-    deadletter_prefix = f"{prefix}:deadletter:"
+    result_prefix = f"{prefix}:result:"
     queue_count = 0
     job_count = 0
-    deadletter_count = 0
+    result_count = 0
     queue_entries = 0
     top_queues: list[tuple[int, str]] = []
 
@@ -80,16 +80,15 @@ async def audit(client: redis.Redis, prefix: str, top: int) -> dict[str, Any]:
             top_queues.append((length, key[len(queue_prefix) :]))
         elif key.startswith(job_prefix):
             job_count += 1
-        elif key.startswith(deadletter_prefix) and key != f"{prefix}:deadletter:index":
-            deadletter_count += 1
+        elif key.startswith(result_prefix):
+            result_count += 1
 
     top_queues.sort(reverse=True)
     memory = await client.info("memory")
     stats = await client.hgetall(f"{prefix}:stats")
     return {
         "database_keys": int(await client.dbsize()),
-        "deadletter_bytes_counter": int(await client.get(f"{prefix}:deadletter:bytes") or 0),
-        "deadletter_hashes": deadletter_count,
+        "delivery_results": result_count,
         "idempotency_index_entries": int(await client.zcard(f"{prefix}:idempotency:index")),
         "jobs": job_count,
         "memory": {

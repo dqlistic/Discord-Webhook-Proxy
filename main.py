@@ -2,7 +2,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import logging
 import os
 import re
 import secrets
@@ -24,7 +23,18 @@ from redis.exceptions import RedisError
 
 WEBHOOK_PATH_RE = re.compile(r"^/api/webhooks/(\d+)/([A-Za-z0-9_-]+)$")
 FAVICON_PATH = Path(__file__).with_name("favicon.png")
-
+FORWARDED_UPSTREAM_HEADERS = frozenset(
+    {
+        "retry-after",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-ratelimit-reset-after",
+        "x-ratelimit-bucket",
+        "x-ratelimit-global",
+        "x-ratelimit-scope",
+    }
+)
 INDEX_HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -1178,6 +1188,8 @@ local webhook_pending_key = KEYS[10]
 local webhook_bytes_key = KEYS[11]
 local target_bytes_key = KEYS[12]
 local webhook_lock_key = KEYS[13]
+local result_key = KEYS[14]
+local idempotency_key = KEYS[15]
 
 local job_id = ARGV[1]
 local target_key = ARGV[2]
@@ -1194,6 +1206,17 @@ local webhook_bytes_prefix = ARGV[12]
 local target_bytes_prefix = ARGV[13]
 local cleanup_limit = tonumber(ARGV[14])
 local now_ms = tonumber(ARGV[15])
+local result_present = ARGV[16]
+local result_ttl = tonumber(ARGV[17])
+local result_status_code = ARGV[18]
+local result_body_b64 = ARGV[19]
+local result_content_type = ARGV[20]
+local result_headers_json = ARGV[21]
+local result_attempts = ARGV[22]
+local result_kind = ARGV[23]
+local result_message = ARGV[24]
+local result_request_id = ARGV[25]
+local has_idempotency_key = ARGV[26]
 
 local function parse_entry(entry)
     local first = string.find(entry, '|', 1, true)
@@ -1214,7 +1237,7 @@ local function meta_token(value)
     local last = nil
     local start = 1
     while true do
-        local pos = string.find(value, '\t', start, true)
+        local pos = string.find(value, '	', start, true)
         if not pos then
             return string.sub(value, start)
         end
@@ -1281,6 +1304,25 @@ if redis.call('GET', lock_key) == claim_value or redis.call('GET', lock_key) == 
 end
 if redis.call('GET', webhook_lock_key) == claim_value or redis.call('GET', webhook_lock_key) == job_id then
     redis.call('DEL', webhook_lock_key)
+end
+
+if result_present == '1' then
+    redis.call(
+        'HSET',
+        result_key,
+        'status_code', result_status_code,
+        'body_b64', result_body_b64,
+        'content_type', result_content_type,
+        'headers_json', result_headers_json,
+        'attempts', result_attempts,
+        'result_kind', result_kind,
+        'result_message', result_message,
+        'request_id', result_request_id
+    )
+    redis.call('EXPIRE', result_key, result_ttl)
+    if has_idempotency_key == '1' and redis.call('EXISTS', idempotency_key) == 1 then
+        redis.call('EXPIRE', idempotency_key, result_ttl)
+    end
 end
 
 if delete_job == '1' then
@@ -1795,7 +1837,8 @@ redis.call(
     'body_sha256', body_sha256,
     'request_sha256', request_sha256,
     'storage_bytes', tostring(storage_bytes),
-    'priority', priority
+    'priority', priority,
+    'idempotency_redis_key', idem_key
 )
 redis.call('EXPIRE', job_key, job_ttl)
 
@@ -1872,87 +1915,6 @@ end
 return {count, ttl_ms, 0}
 """
 
-PUSH_DEADLETTER_LUA = """
-local index_key = KEYS[1]
-local deadletter_key = KEYS[2]
-local stats_key = KEYS[3]
-local bytes_key = KEYS[4]
-
-local ttl_seconds = tonumber(ARGV[1])
-local max_entries = tonumber(ARGV[2])
-local now_ms = tonumber(ARGV[3])
-local deadletter_prefix = ARGV[4]
-local cleanup_limit = tonumber(ARGV[5])
-local field_count = tonumber(ARGV[6])
-local job_id = ARGV[7]
-local storage_bytes = tonumber(ARGV[8])
-local max_bytes = tonumber(ARGV[9])
-
-local function decrement_bytes(amount)
-    local value = tonumber(redis.call('GET', bytes_key) or '0') - amount
-    if value <= 0 then
-        redis.call('SET', bytes_key, '0')
-    else
-        redis.call('SET', bytes_key, tostring(value))
-    end
-end
-
-local function delete_deadletter(entry_job_id)
-    local entry_key = deadletter_prefix .. entry_job_id
-    local charge = tonumber(redis.call('HGET', entry_key, 'storage_bytes') or '0')
-    redis.call('ZREM', index_key, entry_job_id)
-    redis.call('DEL', entry_key)
-    if charge > 0 then
-        decrement_bytes(charge)
-    end
-end
-
-local expired = redis.call('ZRANGEBYSCORE', index_key, '-inf', now_ms, 'LIMIT', 0, cleanup_limit)
-for _, expired_job_id in ipairs(expired) do
-    delete_deadletter(expired_job_id)
-end
-
-if redis.call('EXISTS', deadletter_key) == 1 then
-    delete_deadletter(job_id)
-end
-
-local evicted = 0
-while evicted < cleanup_limit do
-    local cardinality = redis.call('ZCARD', index_key)
-    local current_bytes = tonumber(redis.call('GET', bytes_key) or '0')
-    if cardinality < max_entries and current_bytes + storage_bytes <= max_bytes then
-        break
-    end
-    local oldest = redis.call('ZRANGE', index_key, 0, 0)
-    if not oldest[1] then
-        if cardinality == 0 then
-            redis.call('SET', bytes_key, '0')
-        end
-        break
-    end
-    delete_deadletter(oldest[1])
-    evicted = evicted + 1
-end
-
-local cardinality = redis.call('ZCARD', index_key)
-local current_bytes = tonumber(redis.call('GET', bytes_key) or '0')
-if storage_bytes > max_bytes or cardinality >= max_entries or current_bytes + storage_bytes > max_bytes then
-    redis.call('HINCRBY', stats_key, 'deadletter_dropped', 1)
-    return 0
-end
-
-local args = {}
-local offset = 10
-for index = 1, field_count * 2 do
-    args[index] = ARGV[offset + index - 1]
-end
-redis.call('HSET', deadletter_key, unpack(args))
-redis.call('EXPIRE', deadletter_key, ttl_seconds)
-redis.call('ZADD', index_key, now_ms + (ttl_seconds * 1000), job_id)
-redis.call('INCRBY', bytes_key, storage_bytes)
-redis.call('HINCRBY', stats_key, 'deadletter', 1)
-return 1
-"""
 
 
 def env_value(name: str, default: str = "", legacy_names: tuple[str, ...] = ()) -> str:
@@ -1966,10 +1928,6 @@ def env_value(name: str, default: str = "", legacy_names: tuple[str, ...] = ()) 
     return default
 
 
-def parse_bool(value: str, default: bool = False) -> bool:
-    if value == "":
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def get_int_env(name: str, default: int, legacy_names: tuple[str, ...] = ()) -> int:
@@ -2017,16 +1975,13 @@ def parse_webhook_url(value: str) -> tuple[str, str] | None:
     return match.group(1), match.group(2)
 
 
-def parse_blacklisted_webhooks(raw: str) -> tuple[set[str], list[str]]:
+def parse_blacklisted_webhooks(raw: str) -> set[str]:
     blocked: set[str] = set()
-    invalid: list[str] = []
     for item in csv_items(raw):
         parsed = parse_webhook_url(item)
-        if not parsed:
-            invalid.append(item)
-            continue
-        blocked.add(webhook_key(parsed[0], parsed[1]))
-    return blocked, invalid
+        if parsed:
+            blocked.add(webhook_key(parsed[0], parsed[1]))
+    return blocked
 
 
 class Config:
@@ -2056,10 +2011,18 @@ class Config:
         self.idempotency_ttl_seconds = max(60, get_int_env("IdempotencyTtlSeconds", 86400, ("IDEMPOTENCY_TTL_SECONDS",)))
         self.idempotency_max_entries = max(1, get_int_env("IdempotencyMaxEntries", 100000, ("IDEMPOTENCY_MAX_ENTRIES",)))
         self.idempotency_cleanup_limit = max(1, min(1000, get_int_env("IdempotencyCleanupLimit", 100, ("IDEMPOTENCY_CLEANUP_LIMIT",))))
-        self.deadletter_ttl_seconds = max(60, get_int_env("DeadletterTtlSeconds", 604800, ("DEADLETTER_TTL_SECONDS",)))
-        self.deadletter_max_entries = max(1, get_int_env("DeadletterMaxEntries", 10000, ("DEADLETTER_MAX_ENTRIES", "DEADLETTER_MAXLEN")))
-        self.deadletter_payload_max_bytes = max(0, get_int_env("DeadletterPayloadMaxBytes", 262144, ("DEADLETTER_PAYLOAD_MAX_BYTES",)))
-        self.deadletter_bytes_limit = max(1048576, get_int_env("DeadletterBytesLimit", 134217728, ("DEADLETTER_BYTES_LIMIT",)))
+        self.result_ttl_seconds = max(5, get_int_env("ResultTtlSeconds", 15, ("RESULT_TTL_SECONDS",)))
+        self.result_poll_interval_seconds = max(0.01, get_float_env("ResultPollIntervalSeconds", 0.05, ("RESULT_POLL_INTERVAL_SECONDS",)))
+        self.max_upstream_response_bytes = max(1024, get_int_env("MaxUpstreamResponseBytes", 256 * 1024, ("MAX_UPSTREAM_RESPONSE_BYTES",)))
+        retry_wait_budget = (
+            (self.max_retries + 1) * self.http_timeout_seconds
+            + sum(retry_delay_seconds(index, self) for index in range(1, self.max_retries + 1))
+            + 15.0
+        )
+        self.caller_wait_timeout_seconds = max(
+            self.http_timeout_seconds,
+            get_float_env("CallerWaitTimeoutSeconds", retry_wait_budget, ("CALLER_WAIT_TIMEOUT_SECONDS",)),
+        )
         self.max_body_bytes = max(1024, get_int_env("MaxBodyBytes", 32 * 1024 * 1024, ("MAX_BODY_BYTES",)))
         self.storage_overhead_bytes = max(1024, get_int_env("StorageOverheadBytes", 2048, ("STORAGE_OVERHEAD_BYTES",)))
         self.max_query_length = max(256, get_int_env("MaxQueryLength", 8192, ("MAX_QUERY_LENGTH",)))
@@ -2092,50 +2055,12 @@ class Config:
         self.webhook_abuse_max_block_seconds = min(3600, max(self.webhook_abuse_base_block_seconds, get_int_env("WebhookAbuseMaxBlockSeconds", 3600, ("WEBHOOK_ABUSE_MAX_BLOCK_SECONDS",))))
         self.webhook_abuse_burst_multiplier = max(1.0, get_float_env("WebhookAbuseBurstMultiplier", 2.0, ("WEBHOOK_ABUSE_BURST_MULTIPLIER",)))
         self.rate_limit_violation_ttl_seconds = max(60, get_int_env("RateLimitViolationTtlSeconds", 3600, ("RATE_LIMIT_VIOLATION_TTL_SECONDS",)))
-        self.log_level = env_value("LogLevel", "WARNING", ("LOG_LEVEL",)).strip().upper() or "WARNING"
-        webhook_blacklist_raw = env_value("BlacklistedWebhooks", "", ("BLACKLISTED_WEBHOOKS",))
-        self.blacklisted_webhook_keys, self.invalid_blacklisted_webhooks = parse_blacklisted_webhooks(webhook_blacklist_raw)
+        self.blacklisted_webhook_keys = parse_blacklisted_webhooks(
+            env_value("BlacklistedWebhooks", "", ("BLACKLISTED_WEBHOOKS",))
+        )
 
         if not self.redis_url:
             raise RuntimeError("RedisUrl is required for durable replica-safe dispatching.")
-
-
-class PrettyLogFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-        details = getattr(record, "details", {}) or {}
-        if not isinstance(details, dict):
-            details = {"details": details}
-        rendered = " ".join(f"{key}={self._stringify(value)}" for key, value in details.items() if value is not None)
-        return f"{timestamp} | {record.levelname.title()} | {record.getMessage()}" + (f" | {rendered}" if rendered else "")
-
-    def _stringify(self, value: Any) -> str:
-        if isinstance(value, float):
-            value = round(value, 3)
-        text = str(value)
-        if any(character.isspace() for character in text):
-            return json.dumps(text, ensure_ascii=False)
-        return text
-
-
-def configure_logging(log_level: str) -> logging.Logger:
-    logger = logging.getLogger("discord_proxy")
-    level = getattr(logging, log_level, logging.WARNING)
-    logger.setLevel(level)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(PrettyLogFormatter())
-        logger.addHandler(handler)
-    logger.propagate = False
-    logging.getLogger("uvicorn.access").disabled = True
-    logging.getLogger("httpx").setLevel(logging.CRITICAL)
-    logging.getLogger("httpcore").setLevel(logging.CRITICAL)
-    logging.getLogger("redis").setLevel(logging.CRITICAL)
-    return logger
-
-
-def log_event(logger: logging.Logger, level: int, message: str, details: dict[str, Any] | None = None) -> None:
-    logger.log(level, message, extra={"details": details or {}})
 
 
 def now_ms() -> int:
@@ -2150,16 +2075,8 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def short_hash(value: str) -> str:
-    return sha256_text(value)[:12]
-
-
 def webhook_key(webhook_id: str, webhook_token: str) -> str:
     return sha256_text(f"{webhook_id}:{webhook_token}")
-
-
-def webhook_ref(webhook_id: str, webhook_token: str) -> str:
-    return f"{webhook_id}:{short_hash(webhook_token)}"
 
 
 def target_key(webhook_key_value: str, target_context: str) -> str:
@@ -2261,6 +2178,114 @@ def truncate_text(value: str, limit: int = 240) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 1] + "…"
+
+
+def upstream_headers(response: httpx.Response) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() in FORWARDED_UPSTREAM_HEADERS
+    }
+
+
+def proxy_delivery_result(
+    status_code: int,
+    code: str,
+    message: str,
+    attempts: int,
+    request_id: str,
+) -> dict[str, str]:
+    body = json.dumps(
+        {
+            "message": message,
+            "code": code,
+            "request_id": request_id,
+            "attempts": attempts,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return {
+        "status_code": str(status_code),
+        "body_b64": encode_body(body),
+        "content_type": "application/json",
+        "headers_json": "{}",
+        "attempts": str(attempts),
+        "result_kind": "proxy",
+        "result_message": message,
+        "request_id": request_id,
+    }
+
+
+def upstream_delivery_result(
+    response: httpx.Response,
+    attempts: int,
+    request_id: str,
+    max_response_bytes: int,
+) -> dict[str, str]:
+    body = response.content
+    if len(body) > max_response_bytes:
+        return proxy_delivery_result(
+            status.HTTP_502_BAD_GATEWAY,
+            "upstream_response_too_large",
+            f"Discord returned a response larger than the configured {max_response_bytes}-byte relay limit.",
+            attempts,
+            request_id,
+        )
+    content_type = response.headers.get("content-type", "")
+    if not body and response.status_code >= 400:
+        body = json.dumps(
+            {
+                "message": f"Discord returned HTTP {response.status_code} without a response body.",
+                "code": None,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        content_type = "application/json"
+    return {
+        "status_code": str(response.status_code),
+        "body_b64": encode_body(body),
+        "content_type": content_type,
+        "headers_json": json.dumps(upstream_headers(response), separators=(",", ":")),
+        "attempts": str(attempts),
+        "result_kind": "discord",
+        "result_message": truncate_text(response.text.strip(), 500) if response.text else "",
+        "request_id": request_id,
+    }
+
+
+def delivery_response(result: dict[str, str], fallback_request_id: str) -> Response:
+    try:
+        status_code = int(result["status_code"])
+        if status_code < 100 or status_code > 599:
+            raise ValueError
+        body = decode_body(result.get("body_b64", ""))
+        parsed_headers = json.loads(result.get("headers_json", "{}"))
+        if not isinstance(parsed_headers, dict):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "message": "The proxy received an invalid terminal delivery result.",
+                "code": "invalid_delivery_result",
+                "request_id": fallback_request_id,
+            },
+        )
+
+    headers = {
+        str(name): str(value)
+        for name, value in parsed_headers.items()
+        if str(name).lower() in FORWARDED_UPSTREAM_HEADERS
+    }
+    content_type = result.get("content_type", "").strip()
+    if content_type and not any(ord(character) < 32 or ord(character) == 127 for character in content_type):
+        headers["Content-Type"] = content_type
+    request_id = result.get("request_id") or fallback_request_id
+    headers["X-Proxy-Request-Id"] = request_id
+    headers["X-Proxy-Attempts"] = str(max(1, int(result.get("attempts", "1") or "1")))
+    headers["X-Proxy-Result"] = result.get("result_kind", "unknown")
+    return Response(content=body, status_code=status_code, headers=headers)
 
 
 def retry_delay_seconds(failure_number: int, config: Config, server_retry_after: float | None = None) -> float:
@@ -2376,16 +2401,6 @@ def estimated_storage_bytes(
     return len(body_b64) + len(query_string) + len(content_type) + len(webhook_token) + storage_overhead_bytes
 
 
-def parse_queue_entry(entry: str, fallback_webhook_key: str = "") -> tuple[str, int, str]:
-    parts = entry.split("|", 2)
-    if len(parts) == 1:
-        return parts[0], 0, fallback_webhook_key
-    try:
-        charge = int(parts[1])
-    except ValueError:
-        charge = 0
-    webhook_key_value = parts[2] if len(parts) == 3 else fallback_webhook_key
-    return parts[0], max(charge, 0), webhook_key_value
 
 
 async def read_limited_body(request: Request, max_bytes: int) -> bytes:
@@ -2408,9 +2423,8 @@ async def read_limited_body(request: Request, max_bytes: int) -> bytes:
 
 
 class AppState:
-    def __init__(self, config: Config, logger: logging.Logger) -> None:
+    def __init__(self, config: Config) -> None:
         self.config = config
-        self.logger = logger
         self.instance_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.redis = redis.from_url(
             config.redis_url,
@@ -2446,12 +2460,6 @@ class AppState:
         return f"{self.config.queue_prefix}:processing:meta"
 
     @property
-    def deadletter_index_key(self) -> str:
-        return f"{self.config.queue_prefix}:deadletter:index"
-
-    @property
-    def deadletter_bytes_key(self) -> str:
-        return f"{self.config.queue_prefix}:deadletter:bytes"
 
     @property
     def stats_key(self) -> str:
@@ -2495,6 +2503,9 @@ class AppState:
     def job_key(self, job_id: str) -> str:
         return f"{self.config.queue_prefix}:job:{job_id}"
 
+    def result_key(self, job_id: str) -> str:
+        return f"{self.config.queue_prefix}:result:{job_id}"
+
     def target_queue_key(self, target_key_value: str) -> str:
         return f"{self.config.queue_prefix}:webhook-queue:{target_key_value}"
 
@@ -2526,27 +2537,13 @@ class AppState:
     def rate_limit_key(self, subject_key: str, kind: str) -> str:
         return f"{self.config.queue_prefix}:ratelimit:webhook:{subject_key}:{kind}"
 
-    def deadletter_key(self, job_id: str) -> str:
-        return f"{self.config.queue_prefix}:deadletter:{job_id}"
 
     async def start(self) -> None:
         await self.redis.ping()
+        await self.purge_obsolete_storage()
         for index in range(self.config.dispatch_concurrency):
             self.tasks.append(asyncio.create_task(self.worker_loop(index), name=f"worker-{index}"))
         self.tasks.append(asyncio.create_task(self.reclaim_loop(), name="reclaimer"))
-        log_event(
-            self.logger,
-            logging.INFO,
-            "Service ready",
-            {
-                "instance": self.instance_id,
-                "dispatch_concurrency": self.config.dispatch_concurrency,
-                "queue_prefix": self.config.queue_prefix,
-                "blacklisted_webhooks": len(self.config.blacklisted_webhook_keys),
-            },
-        )
-        for invalid in self.config.invalid_blacklisted_webhooks:
-            log_event(self.logger, logging.WARNING, "Invalid blacklisted webhook ignored", {"entry_hash": short_hash(invalid)})
 
     async def stop(self) -> None:
         self.shutdown_event.set()
@@ -2555,7 +2552,37 @@ class AppState:
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.http_client.aclose()
         await self.redis.aclose()
-        log_event(self.logger, logging.INFO, "Service stopped", {"instance": self.instance_id})
+
+    async def purge_obsolete_storage(self) -> None:
+        batch: list[str] = []
+        async for key in self.redis.scan_iter(
+            match=f"{self.config.queue_prefix}:deadletter:*",
+            count=1000,
+        ):
+            batch.append(key)
+            if len(batch) >= 500:
+                await self.redis.unlink(*batch)
+                batch.clear()
+        if batch:
+            await self.redis.unlink(*batch)
+        await self.redis.hdel(self.stats_key, "deadletter", "deadletter_dropped")
+
+    async def wait_for_delivery_result(
+        self,
+        job_id: str,
+        request: Request,
+    ) -> tuple[dict[str, str] | None, str]:
+        deadline = time.monotonic() + self.config.caller_wait_timeout_seconds
+        while True:
+            result = await self.redis.hgetall(self.result_key(job_id))
+            if result:
+                return result, "completed"
+            if await request.is_disconnected():
+                return None, "disconnected"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "timeout"
+            await asyncio.sleep(min(self.config.result_poll_interval_seconds, remaining))
 
     async def increment_stat(self, field: str, amount: int = 1) -> None:
         try:
@@ -2703,10 +2730,15 @@ class AppState:
         webhook_key_value: str,
         claim_token: str,
         delete_job: bool = True,
+        result: dict[str, str] | None = None,
+        idempotency_redis_key: str = "",
     ) -> str:
-        result = await self.redis.eval(
+        result_values = result or {}
+        result_key_value = self.result_key(job_id)
+        idempotency_key_value = idempotency_redis_key or result_key_value
+        response = await self.redis.eval(
             FINALIZE_JOB_LUA,
-            13,
+            15,
             self.ready_targets_key,
             self.processing_jobs_key,
             self.processing_meta_key,
@@ -2720,6 +2752,8 @@ class AppState:
             self.webhook_bytes_key(webhook_key_value),
             self.target_bytes_key(target_key_value),
             self.webhook_lock_key(webhook_key_value),
+            result_key_value,
+            idempotency_key_value,
             job_id,
             target_key_value,
             queue_entry,
@@ -2735,8 +2769,19 @@ class AppState:
             f"{self.config.queue_prefix}:pending:target-bytes:",
             str(self.config.stale_cleanup_limit),
             str(now_ms()),
+            "1" if result is not None else "0",
+            str(self.config.result_ttl_seconds),
+            result_values.get("status_code", ""),
+            result_values.get("body_b64", ""),
+            result_values.get("content_type", ""),
+            result_values.get("headers_json", "{}"),
+            result_values.get("attempts", "1"),
+            result_values.get("result_kind", "unknown"),
+            result_values.get("result_message", ""),
+            result_values.get("request_id", ""),
+            "1" if idempotency_redis_key else "0",
         )
-        return str(result[0]) if result else "unknown"
+        return str(response[0]) if response else "unknown"
 
     async def reschedule_job(
         self,
@@ -2881,76 +2926,8 @@ class AppState:
             "storage_bytes": storage_bytes,
         }
 
-    async def push_deadletter(
-        self,
-        job: dict[str, str],
-        reason: str,
-        status_code: int | None,
-        response_excerpt: str,
-        attempts: int,
-    ) -> None:
-        body_b64 = job.get("body_b64", "")
-        body_bytes = 0
-        try:
-            body_bytes = len(base64.b64decode(body_b64, validate=True))
-        except (ValueError, TypeError):
-            body_b64 = ""
 
-        payload_omitted = body_bytes > self.config.deadletter_payload_max_bytes
-        if payload_omitted:
-            body_b64 = ""
-
-        fields = {
-            "job_id": job.get("job_id", ""),
-            "request_id": job.get("request_id", ""),
-            "webhook_id": job.get("webhook_id", ""),
-            "webhook_token": job.get("webhook_token", ""),
-            "webhook_ref": webhook_ref(job.get("webhook_id", ""), job.get("webhook_token", "")),
-            "webhook_key": job.get("webhook_key", ""),
-            "target_key": job.get("target_key", job.get("webhook_key", "")),
-            "target_context": job.get("target_context", "webhook"),
-            "query_string": job.get("query_string", ""),
-            "content_type": job.get("content_type", ""),
-            "body_b64": body_b64,
-            "payload_omitted": "1" if payload_omitted else "0",
-            "reason": reason,
-            "status_code": "" if status_code is None else str(status_code),
-            "attempts": str(attempts),
-            "created_at_ms": job.get("created_at_ms", "0"),
-            "finalized_at_ms": str(now_ms()),
-            "response_excerpt": response_excerpt,
-            "request_sha256": job.get("request_sha256", ""),
-        }
-        storage_bytes = (
-            sum(len(key) + len(value) for key, value in fields.items())
-            + self.config.storage_overhead_bytes
-            + 64
-        )
-        fields["storage_bytes"] = str(storage_bytes)
-        arguments: list[str] = []
-        for key, value in fields.items():
-            arguments.extend([key, value])
-
-        await self.redis.eval(
-            PUSH_DEADLETTER_LUA,
-            4,
-            self.deadletter_index_key,
-            self.deadletter_key(job["job_id"]),
-            self.stats_key,
-            self.deadletter_bytes_key,
-            str(self.config.deadletter_ttl_seconds),
-            str(self.config.deadletter_max_entries),
-            str(now_ms()),
-            f"{self.config.queue_prefix}:deadletter:",
-            "100",
-            str(len(fields)),
-            job["job_id"],
-            str(storage_bytes),
-            str(self.config.deadletter_bytes_limit),
-            *arguments,
-        )
-
-    async def worker_loop(self, worker_index: int) -> None:
+    async def worker_loop(self, _worker_index: int) -> None:
         while not self.shutdown_event.is_set():
             try:
                 if await self.sleep_if_global_backoff():
@@ -2980,17 +2957,10 @@ class AppState:
                     queue_entry,
                     webhook_key_value,
                     claim_token,
-                    worker_index,
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                log_event(
-                    self.logger,
-                    logging.ERROR,
-                    "Worker loop fault",
-                    {"worker": worker_index, "fault": truncate_text(str(exc))},
-                )
+            except Exception:
                 await asyncio.sleep(self.config.poll_interval_seconds)
 
     async def process_job(
@@ -3000,57 +2970,95 @@ class AppState:
         queue_entry: str,
         webhook_key_value: str,
         claim_token: str,
-        worker_index: int,
     ) -> None:
         job_id = job["job_id"]
+        request_id = job.get("request_id", "")
+        idempotency_redis_key = job.get("idempotency_redis_key", "")
         attempts = int(job.get("attempts", "0"))
+        attempt_number = attempts + 1
         url = build_discord_url(job["webhook_id"], job["webhook_token"], job.get("query_string", ""))
+
         try:
             body = decode_body(job["body_b64"])
-        except (ValueError, TypeError) as exc:
-            failed_attempts = attempts + 1
-            await self.push_deadletter(job, "corrupt_stored_payload", None, truncate_text(str(exc)), failed_attempts)
-            await self.finalize_job(job_id, target_key_value, queue_entry, webhook_key_value, claim_token)
+        except (ValueError, TypeError):
+            result = proxy_delivery_result(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "stored_payload_corrupt",
+                "The queued payload could not be decoded safely.",
+                attempt_number,
+                request_id,
+            )
+            await self.finalize_job(
+                job_id,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                result=result,
+                idempotency_redis_key=idempotency_redis_key,
+            )
+            await self.increment_stat("discarded")
             return
 
         headers = {
             "Content-Type": job.get("content_type", "application/json"),
-            "User-Agent": "discord-webhook-proxy/4.0",
+            "User-Agent": "discord-webhook-proxy/5.0",
         }
 
         try:
             response = await self.http_client.post(url, content=body, headers=headers)
-        except httpx.TimeoutException as exc:
+        except httpx.TimeoutException:
+            final_result = proxy_delivery_result(
+                status.HTTP_504_GATEWAY_TIMEOUT,
+                "discord_timeout",
+                "Discord did not respond before the configured request timeout.",
+                attempt_number,
+                request_id,
+            )
             await self.handle_retry(
                 job,
                 target_key_value,
                 queue_entry,
                 webhook_key_value,
                 claim_token,
-                attempts + 1,
+                attempt_number,
                 "upstream_timeout",
                 "",
-                retry_delay_seconds(attempts + 1, self.config),
-                exc,
+                retry_delay_seconds(attempt_number, self.config),
+                "Discord request timed out.",
+                final_result,
             )
             return
-        except httpx.RequestError as exc:
+        except httpx.RequestError:
+            final_result = proxy_delivery_result(
+                status.HTTP_502_BAD_GATEWAY,
+                "discord_network_failure",
+                "The proxy could not complete the network request to Discord.",
+                attempt_number,
+                request_id,
+            )
             await self.handle_retry(
                 job,
                 target_key_value,
                 queue_entry,
                 webhook_key_value,
                 claim_token,
-                attempts + 1,
+                attempt_number,
                 "network_error",
                 "",
-                retry_delay_seconds(attempts + 1, self.config),
-                exc,
+                retry_delay_seconds(attempt_number, self.config),
+                "Discord network request failed.",
+                final_result,
             )
             return
 
         status_code = response.status_code
-        response_excerpt = truncate_text(response.text.strip()) if response.text else ""
+        final_result = upstream_delivery_result(
+            response,
+            attempt_number,
+            request_id,
+            self.config.max_upstream_response_bytes,
+        )
 
         if status_code in {401, 403, 429}:
             await self.record_invalid_request()
@@ -3059,8 +3067,29 @@ class AppState:
         if reset_after is not None and reset_after > 0:
             await self.set_webhook_backoff(webhook_key_value, reset_after)
 
+        if int(final_result["status_code"]) != status_code:
+            await self.finalize_job(
+                job_id,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                result=final_result,
+                idempotency_redis_key=idempotency_redis_key,
+            )
+            await self.increment_stat("discarded")
+            return
+
         if 200 <= status_code < 300:
-            await self.finalize_job(job_id, target_key_value, queue_entry, webhook_key_value, claim_token)
+            await self.finalize_job(
+                job_id,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                result=final_result,
+                idempotency_redis_key=idempotency_redis_key,
+            )
             await self.increment_stat("sent")
             return
 
@@ -3076,11 +3105,12 @@ class AppState:
                 queue_entry,
                 webhook_key_value,
                 claim_token,
-                attempts + 1,
+                attempt_number,
                 "rate_limited",
                 str(status_code),
-                retry_delay_seconds(attempts + 1, self.config, retry_after),
-                response_excerpt,
+                retry_delay_seconds(attempt_number, self.config, retry_after),
+                final_result.get("result_message", "Discord rate limited the request."),
+                final_result,
             )
             return
 
@@ -3091,23 +3121,25 @@ class AppState:
                 queue_entry,
                 webhook_key_value,
                 claim_token,
-                attempts + 1,
+                attempt_number,
                 "upstream_error",
                 str(status_code),
-                retry_delay_seconds(attempts + 1, self.config),
-                response_excerpt,
+                retry_delay_seconds(attempt_number, self.config),
+                final_result.get("result_message", f"Discord returned HTTP {status_code}."),
+                final_result,
             )
             return
 
-        failed_attempts = attempts + 1
-        await self.push_deadletter(
-            job,
-            "non_retryable_upstream_response",
-            status_code,
-            response_excerpt,
-            failed_attempts,
+        await self.finalize_job(
+            job_id,
+            target_key_value,
+            queue_entry,
+            webhook_key_value,
+            claim_token,
+            result=final_result,
+            idempotency_redis_key=idempotency_redis_key,
         )
-        await self.finalize_job(job_id, target_key_value, queue_entry, webhook_key_value, claim_token)
+        await self.increment_stat("discarded")
 
     async def handle_retry(
         self,
@@ -3120,19 +3152,21 @@ class AppState:
         reason: str,
         status_value: str,
         delay_seconds: float,
-        error_value: Any,
+        last_error: str,
+        final_result: dict[str, str],
     ) -> None:
         job_id = job["job_id"]
         if attempts > self.config.max_retries:
-            response_excerpt = truncate_text(str(error_value))
-            await self.push_deadletter(
-                job,
-                f"{reason}_max_retries_exhausted",
-                int(status_value) if status_value.isdigit() else None,
-                response_excerpt,
-                attempts,
+            await self.finalize_job(
+                job_id,
+                target_key_value,
+                queue_entry,
+                webhook_key_value,
+                claim_token,
+                result=final_result,
+                idempotency_redis_key=job.get("idempotency_redis_key", ""),
             )
-            await self.finalize_job(job_id, target_key_value, queue_entry, webhook_key_value, claim_token)
+            await self.increment_stat("discarded")
             return
 
         next_available_at = now_ms() + int(delay_seconds * 1000)
@@ -3144,7 +3178,7 @@ class AppState:
             claim_token=claim_token,
             next_available_at_ms=next_available_at,
             attempts=attempts,
-            last_error=truncate_text(str(error_value), 500),
+            last_error=truncate_text(last_error, 500),
             last_status=status_value,
         )
         if state == "rescheduled":
@@ -3157,8 +3191,8 @@ class AppState:
                 await self.reclaim_expired_jobs()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                log_event(self.logger, logging.ERROR, "Reclaimer fault", {"fault": truncate_text(str(exc))})
+            except Exception:
+                continue
 
     async def reclaim_expired_jobs(self) -> None:
         expired_ids = await self.redis.zrangebyscore(
@@ -3211,10 +3245,10 @@ def get_state(request: Request) -> AppState:
 
 
 @asynccontextmanager
+@asynccontextmanager
 async def lifespan(app_instance: FastAPI):
     config = Config()
-    logger = configure_logging(config.log_level)
-    state = AppState(config, logger)
+    state = AppState(config)
     app_instance.state.state = state
     await state.start()
     try:
@@ -3225,15 +3259,29 @@ async def lifespan(app_instance: FastAPI):
 
 app = FastAPI(
     title="Discord Webhook Proxy",
-    description="A queue-bounded, rate-limit-aware relay for Discord webhooks.",
-    version="4.0.0",
+    description="A queue-bounded, rate-limit-aware relay that returns terminal Discord responses.",
+    version="5.0.0",
     lifespan=lifespan,
 )
 
 
 @app.middleware("http")
+@app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
-    response = await call_next(request)
+    response: Response
+    if request.method == "POST":
+        match = WEBHOOK_PATH_RE.fullmatch(request.url.path)
+        state = getattr(request.app.state, "state", None)
+        if (
+            match
+            and state is not None
+            and webhook_key(match.group(1), match.group(2)) in state.config.blacklisted_webhook_keys
+        ):
+            response = blacklisted_webhook_response()
+        else:
+            response = await call_next(request)
+    else:
+        response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -3243,26 +3291,6 @@ async def security_headers_middleware(request: Request, call_next):
     if request.url.scheme == "https":
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
-
-
-@app.middleware("http")
-async def ingress_capacity_middleware(request: Request, call_next):
-    if request.method != "POST" or not request.url.path.startswith("/api/webhooks/"):
-        return await call_next(request)
-    state = get_state(request)
-    try:
-        await asyncio.wait_for(state.ingress_slots.acquire(), timeout=state.config.ingress_wait_seconds)
-    except TimeoutError:
-        await state.increment_stat("ingress_rejected")
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            headers={"Retry-After": "1"},
-            content={"error": "Proxy request capacity reached.", "retry_after": 1},
-        )
-    try:
-        return await call_next(request)
-    finally:
-        state.ingress_slots.release()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -3301,6 +3329,7 @@ async def og_image() -> Response:
 
 
 @app.get("/api/stats")
+@app.get("/api/stats")
 async def api_stats(request: Request) -> JSONResponse:
     state = get_state(request)
     try:
@@ -3312,7 +3341,6 @@ async def api_stats(request: Request) -> JSONResponse:
         pipe.get(state.pending_bytes_key)
         pipe.zcard(state.ready_targets_key)
         pipe.zcard(state.processing_jobs_key)
-        pipe.get(state.deadletter_bytes_key)
         (
             stats_raw,
             hll_webhooks,
@@ -3321,7 +3349,6 @@ async def api_stats(request: Request) -> JSONResponse:
             pending_bytes,
             ready_targets,
             processing_jobs,
-            deadletter_bytes,
         ) = await pipe.execute()
         stats = integer_dict(stats_raw)
         requests_served = stats.get("accepted", 0) + stats.get("duplicates", 0)
@@ -3335,13 +3362,11 @@ async def api_stats(request: Request) -> JSONResponse:
                 "duplicates": stats.get("duplicates", 0),
                 "sent": stats.get("sent", 0),
                 "retried": stats.get("retried", 0),
+                "discarded": stats.get("discarded", 0),
                 "rejected": stats.get("rejected", 0),
                 "blocked": stats.get("blocked", 0),
                 "rate_limited": stats.get("rate_limited", 0),
                 "invalid_requests": stats.get("invalid_requests", 0),
-                "deadletter": stats.get("deadletter", 0),
-                "deadletter_dropped": stats.get("deadletter_dropped", 0),
-                "deadletter_bytes": max(int(deadletter_bytes or 0), 0),
                 "reclaimed": stats.get("reclaimed", 0),
                 "ingress_rejected": stats.get("ingress_rejected", 0),
                 "pending_jobs": max(int(pending_jobs or 0), 0),
@@ -3353,7 +3378,11 @@ async def api_stats(request: Request) -> JSONResponse:
     except RedisError:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": "Stats are temporarily unavailable."},
+            content={
+                "error": "Stats are temporarily unavailable.",
+                "message": "Stats are temporarily unavailable.",
+                "code": "stats_unavailable",
+            },
         )
 
 
@@ -3388,123 +3417,279 @@ async def reject_request(
     error: str,
     stat: str,
     retry_after: int | None = None,
+    code: str = "proxy_request_rejected",
+    details: dict[str, Any] | None = None,
 ) -> JSONResponse:
     await state.increment_stat(stat)
     headers = {"Retry-After": str(max(1, retry_after))} if retry_after is not None else None
-    content: dict[str, Any] = {"error": error}
+    content: dict[str, Any] = {
+        "error": error,
+        "message": error,
+        "code": code,
+    }
     if retry_after is not None:
         content["retry_after"] = max(1, retry_after)
+    if details:
+        content.update(details)
     return JSONResponse(status_code=status_code, content=content, headers=headers)
+
+
+def blacklisted_webhook_response() -> JSONResponse:
+    message = "This webhook is blocked from using the proxy."
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={
+            "error": message,
+            "message": message,
+            "code": "blacklisted_webhook",
+        },
+    )
 
 
 def overload_message(reason: str) -> str:
     if reason.startswith("global_") or reason.startswith("absolute_"):
-        return "Global queue overloaded"
+        return "Global queue capacity was exceeded."
     if reason.startswith("target_"):
-        return "Webhook target queue overloaded"
-    return "Webhook queue overloaded"
+        return "The target-specific webhook queue capacity was exceeded."
+    return "The webhook queue capacity was exceeded."
 
 
-@app.post("/api/webhooks/{webhook_id}/{webhook_token}")
-async def proxy_webhook(
+async def admit_webhook_request(
     request: Request,
-    webhook_id: str = FastAPIPath(..., pattern=r"^\d+$", max_length=20),
-    webhook_token: str = FastAPIPath(..., pattern=r"^[A-Za-z0-9_-]+$", max_length=256),
-) -> JSONResponse:
-    state = get_state(request)
-    webhook_key_value = webhook_key(webhook_id, webhook_token)
-
-    if webhook_key_value in state.config.blacklisted_webhook_keys:
-        return await reject_request(
-            state,
-            status.HTTP_403_FORBIDDEN,
-            "This webhook is blocked from using the proxy.",
-            "blocked",
-        )
-
-    api_key_headers = request.headers.getlist("x-api-key")
-    if len(api_key_headers) > 1:
-        return await reject_request(
-            state,
-            status.HTTP_400_BAD_REQUEST,
-            "X-Api-Key may be provided only once.",
-            "rejected",
-        )
-
+    state: AppState,
+    webhook_id: str,
+    webhook_token: str,
+    webhook_key_value: str,
+) -> dict[str, Any] | Response:
     try:
-        query_string, priority, thread_id = sanitize_query_string(
-            request.url.query,
-            state.config,
-            api_key_headers[0] if api_key_headers else None,
+        await asyncio.wait_for(
+            state.ingress_slots.acquire(),
+            timeout=state.config.ingress_wait_seconds,
         )
-    except HTTPException as exc:
-        return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
-
-    idempotency_headers = (
-        request.headers.getlist("x-idempotency-key")
-        + request.headers.getlist("idempotency-key")
-    )
-    if len(idempotency_headers) > 1:
-        return await reject_request(
-            state,
-            status.HTTP_400_BAD_REQUEST,
-            "Idempotency key may be provided only once.",
-            "rejected",
-        )
-    idempotency_key_value = idempotency_headers[0] if idempotency_headers else None
-    if idempotency_key_value and len(idempotency_key_value) > state.config.max_idempotency_key_length:
-        return await reject_request(
-            state,
-            status.HTTP_400_BAD_REQUEST,
-            "Idempotency key too large.",
-            "rejected",
-        )
-
-    try:
-        rate_limit = await state.check_rate_limit(webhook_key_value)
-    except RedisError:
-        return await reject_request(
-            state,
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Queue storage is temporarily unavailable.",
-            "rejected",
-            1,
-        )
-    if not rate_limit["allowed"]:
-        await state.increment_stat("blocked" if rate_limit["blocked"] else "rate_limited")
+    except TimeoutError:
+        await state.increment_stat("ingress_rejected")
+        message = "The proxy has no free request-admission slot."
         return JSONResponse(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            headers={"Retry-After": str(max(1, rate_limit["retry_after"]))},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "1"},
             content={
-                "error": "Temporarily rate limited. Slow down before retrying.",
-                "retry_after": max(1, rate_limit["retry_after"]),
+                "error": message,
+                "message": message,
+                "code": "proxy_admission_capacity_reached",
+                "retry_after": 1,
             },
         )
 
-    normalized_content_type = normalize_content_type(request.headers.get("content-type", ""))
-    preliminary_context = f"thread_id:{thread_id}" if thread_id else "webhook"
-    preliminary_target_key = target_key(webhook_key_value, preliminary_context)
-    content_length = request.headers.get("content-length")
-    estimated_request_bytes = state.config.storage_overhead_bytes
-    if content_length:
-        try:
-            estimated_request_bytes += max(0, int(content_length) * 4 // 3)
-        except ValueError:
+    try:
+        api_key_headers = request.headers.getlist("x-api-key")
+        if len(api_key_headers) > 1:
             return await reject_request(
                 state,
                 status.HTTP_400_BAD_REQUEST,
-                "Invalid Content-Length header.",
+                "X-Api-Key may be provided only once.",
                 "rejected",
+                code="duplicate_api_key_header",
             )
 
-    if not idempotency_key_value:
         try:
-            preflight_reason = await state.preflight_admission(
-                webhook_key_value,
-                preliminary_target_key,
-                priority,
-                estimated_request_bytes,
-                check_target=thread_id is not None or normalized_content_type not in {"application/json", "text/json"},
+            query_string, priority, thread_id = sanitize_query_string(
+                request.url.query,
+                state.config,
+                api_key_headers[0] if api_key_headers else None,
+            )
+        except HTTPException as exc:
+            return await reject_request(
+                state,
+                exc.status_code,
+                str(exc.detail),
+                "rejected",
+                code="invalid_query_or_api_key",
+            )
+
+        idempotency_headers = (
+            request.headers.getlist("x-idempotency-key")
+            + request.headers.getlist("idempotency-key")
+        )
+        if len(idempotency_headers) > 1:
+            return await reject_request(
+                state,
+                status.HTTP_400_BAD_REQUEST,
+                "Idempotency key may be provided only once.",
+                "rejected",
+                code="duplicate_idempotency_key",
+            )
+        idempotency_key_value = idempotency_headers[0] if idempotency_headers else None
+        if idempotency_key_value and len(idempotency_key_value) > state.config.max_idempotency_key_length:
+            return await reject_request(
+                state,
+                status.HTTP_400_BAD_REQUEST,
+                "Idempotency key too large.",
+                "rejected",
+                code="idempotency_key_too_large",
+            )
+
+        try:
+            rate_limit = await state.check_rate_limit(webhook_key_value)
+        except RedisError:
+            return await reject_request(
+                state,
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Queue storage is temporarily unavailable.",
+                "rejected",
+                1,
+                code="queue_storage_unavailable",
+            )
+        if not rate_limit["allowed"]:
+            blocked = rate_limit["blocked"]
+            await state.increment_stat("blocked" if blocked else "rate_limited")
+            retry_after = max(1, rate_limit["retry_after"])
+            message = (
+                "This webhook is temporarily blocked after repeated proxy rate-limit violations."
+                if blocked
+                else "This webhook exceeded the proxy ingress rate limit."
+            )
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(retry_after)},
+                content={
+                    "error": message,
+                    "message": message,
+                    "code": "proxy_webhook_temporarily_blocked" if blocked else "proxy_webhook_rate_limited",
+                    "retry_after": retry_after,
+                    "observed_requests": rate_limit["count"],
+                    "request_limit": rate_limit["limit"],
+                },
+            )
+
+        normalized_content_type = normalize_content_type(request.headers.get("content-type", ""))
+        preliminary_context = f"thread_id:{thread_id}" if thread_id else "webhook"
+        preliminary_target_key = target_key(webhook_key_value, preliminary_context)
+        content_length = request.headers.get("content-length")
+        estimated_request_bytes = state.config.storage_overhead_bytes
+        if content_length:
+            try:
+                estimated_request_bytes += max(0, int(content_length) * 4 // 3)
+            except ValueError:
+                return await reject_request(
+                    state,
+                    status.HTTP_400_BAD_REQUEST,
+                    "Invalid Content-Length header.",
+                    "rejected",
+                    code="invalid_content_length",
+                )
+
+        if not idempotency_key_value:
+            try:
+                preflight_reason = await state.preflight_admission(
+                    webhook_key_value,
+                    preliminary_target_key,
+                    priority,
+                    estimated_request_bytes,
+                    check_target=thread_id is not None or normalized_content_type not in {"application/json", "text/json"},
+                )
+            except RedisError:
+                return await reject_request(
+                    state,
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Queue storage is temporarily unavailable.",
+                    "rejected",
+                    1,
+                    code="queue_storage_unavailable",
+                )
+            if preflight_reason:
+                retry_after = state.config.overload_retry_after_seconds
+                message = overload_message(preflight_reason)
+                return await reject_request(
+                    state,
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    message,
+                    "rejected",
+                    retry_after,
+                    code=preflight_reason,
+                    details={"capacity_scope": preflight_reason},
+                )
+
+        try:
+            body = await read_limited_body(request, state.config.max_body_bytes)
+        except HTTPException as exc:
+            return await reject_request(
+                state,
+                exc.status_code,
+                str(exc.detail),
+                "rejected",
+                code="invalid_request_body",
+            )
+
+        if not body:
+            return await reject_request(
+                state,
+                status.HTTP_400_BAD_REQUEST,
+                "Empty payload rejected.",
+                "rejected",
+                code="empty_payload",
+            )
+
+        try:
+            content_type = validate_content_type(
+                request.headers.get("content-type", ""),
+                state.config.max_content_type_length,
+            )
+        except HTTPException as exc:
+            return await reject_request(
+                state,
+                exc.status_code,
+                str(exc.detail),
+                "rejected",
+                code="invalid_content_type",
+            )
+
+        normalized_content_type = normalize_content_type(content_type)
+        if normalized_content_type in {"application/json", "text/json"} or (
+            not normalized_content_type and looks_like_json(body)
+        ):
+            try:
+                json.loads(body)
+            except (ValueError, TypeError):
+                return await reject_request(
+                    state,
+                    status.HTTP_400_BAD_REQUEST,
+                    "Malformed JSON payload rejected.",
+                    "rejected",
+                    code="malformed_json",
+                )
+            if not content_type:
+                content_type = "application/json"
+
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        target_context = derive_target_context(
+            thread_id,
+            normalize_content_type(content_type),
+            body,
+        )
+        target_key_value = target_key(webhook_key_value, target_context)
+
+        try:
+            enqueue_result = await state.enqueue_job(
+                webhook_id=webhook_id,
+                webhook_token=webhook_token,
+                webhook_key_value=webhook_key_value,
+                target_key_value=target_key_value,
+                target_context=target_context,
+                query_string=query_string,
+                body=body,
+                content_type=content_type,
+                priority=priority,
+                idempotency_key_value=idempotency_key_value,
+            )
+        except HTTPException as exc:
+            return await reject_request(
+                state,
+                exc.status_code,
+                str(exc.detail),
+                "rejected",
+                code="idempotency_conflict",
             )
         except RedisError:
             return await reject_request(
@@ -3513,98 +3698,89 @@ async def proxy_webhook(
                 "Queue storage is temporarily unavailable.",
                 "rejected",
                 1,
+                code="queue_storage_unavailable",
             )
-        if preflight_reason:
+
+        if enqueue_result["status"].endswith("_overloaded"):
+            retry_after = state.config.overload_retry_after_seconds
+            message = overload_message(enqueue_result["status"])
             return await reject_request(
                 state,
                 status.HTTP_429_TOO_MANY_REQUESTS,
-                overload_message(preflight_reason),
+                message,
                 "rejected",
-                state.config.overload_retry_after_seconds,
+                retry_after,
+                code=enqueue_result["status"],
+                details={"capacity_scope": enqueue_result["status"]},
             )
 
-    try:
-        body = await read_limited_body(request, state.config.max_body_bytes)
-    except HTTPException as exc:
-        return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
-
-    if not body:
-        return await reject_request(
-            state,
-            status.HTTP_400_BAD_REQUEST,
-            "Empty payload rejected.",
-            "rejected",
-        )
-
-    try:
-        content_type = validate_content_type(
-            request.headers.get("content-type", ""),
-            state.config.max_content_type_length,
-        )
-    except HTTPException as exc:
-        return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
-
-    normalized_content_type = normalize_content_type(content_type)
-    if normalized_content_type in {"application/json", "text/json"} or (not normalized_content_type and looks_like_json(body)):
-        try:
-            json.loads(body)
-        except (ValueError, TypeError):
-            return await reject_request(
-                state,
-                status.HTTP_400_BAD_REQUEST,
-                "Malformed JSON payload rejected.",
-                "rejected",
-            )
-        if not content_type:
-            content_type = "application/json"
-
-    if not content_type:
-        content_type = "application/octet-stream"
-
-    target_context = derive_target_context(thread_id, normalize_content_type(content_type), body)
-    target_key_value = target_key(webhook_key_value, target_context)
-
-    try:
-        enqueue_result = await state.enqueue_job(
-            webhook_id=webhook_id,
-            webhook_token=webhook_token,
-            webhook_key_value=webhook_key_value,
-            target_key_value=target_key_value,
-            target_context=target_context,
-            query_string=query_string,
-            body=body,
-            content_type=content_type,
-            priority=priority,
-            idempotency_key_value=idempotency_key_value,
-        )
-    except HTTPException as exc:
-        return await reject_request(state, exc.status_code, str(exc.detail), "rejected")
-    except RedisError:
-        return await reject_request(
-            state,
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Queue storage is temporarily unavailable.",
-            "rejected",
-            1,
-        )
-
-    if enqueue_result["status"].endswith("_overloaded"):
-        return await reject_request(
-            state,
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            overload_message(enqueue_result["status"]),
-            "rejected",
-            state.config.overload_retry_after_seconds,
-        )
-
-    return JSONResponse(
-        status_code=status.HTTP_202_ACCEPTED,
-        content={
-            "message": "Accepted",
-            "request_id": enqueue_result["request_id"],
-            "duplicate": enqueue_result["duplicate"],
+        return {
+            "enqueue_result": enqueue_result,
             "priority": priority,
             "target_context": target_context,
+        }
+    finally:
+        state.ingress_slots.release()
+
+
+@app.post("/api/webhooks/{webhook_id}/{webhook_token}")
+async def proxy_webhook(
+    request: Request,
+    webhook_id: str = FastAPIPath(..., pattern=r"^\d+$", max_length=20),
+    webhook_token: str = FastAPIPath(..., pattern=r"^[A-Za-z0-9_-]+$", max_length=256),
+) -> Response:
+    state = get_state(request)
+    webhook_key_value = webhook_key(webhook_id, webhook_token)
+
+    if webhook_key_value in state.config.blacklisted_webhook_keys:
+        return blacklisted_webhook_response()
+
+    admission = await admit_webhook_request(
+        request,
+        state,
+        webhook_id,
+        webhook_token,
+        webhook_key_value,
+    )
+    if isinstance(admission, Response):
+        return admission
+
+    enqueue_result = admission["enqueue_result"]
+    try:
+        result, wait_state = await state.wait_for_delivery_result(
+            enqueue_result["job_id"],
+            request,
+        )
+    except RedisError:
+        message = "The proxy lost access to the delivery result store."
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "1"},
+            content={
+                "error": message,
+                "message": message,
+                "code": "delivery_result_store_unavailable",
+                "request_id": enqueue_result["request_id"],
+                "retry_after": 1,
+            },
+        )
+
+    if wait_state == "completed" and result is not None:
+        return delivery_response(result, enqueue_result["request_id"])
+
+    if wait_state == "disconnected":
+        return Response(status_code=499)
+
+    message = "Discord delivery did not reach a terminal result before the proxy response deadline."
+    return JSONResponse(
+        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        content={
+            "error": message,
+            "message": message,
+            "code": "delivery_result_timeout",
+            "request_id": enqueue_result["request_id"],
+            "job_id": enqueue_result["job_id"],
+            "duplicate": enqueue_result["duplicate"],
         },
     )
 
