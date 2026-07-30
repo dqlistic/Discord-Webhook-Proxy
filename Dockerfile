@@ -9,7 +9,8 @@ RUN useradd --create-home --uid 10001 appuser
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+RUN python -m pip install --no-cache-dir --disable-pip-version-check --upgrade pip==26.1.2
+RUN python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 
 COPY main.py .
 COPY maintenance.py .
@@ -17,7 +18,6 @@ COPY selftest.py .
 COPY favicon.png .
 
 RUN python selftest.py
-RUN chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000

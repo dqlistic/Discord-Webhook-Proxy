@@ -49,7 +49,7 @@ def estimate_storage(job: dict[str, str]) -> int:
         + len(job.get("query_string", ""))
         + len(job.get("content_type", ""))
         + len(job.get("webhook_token", ""))
-        + 768
+        + 2048
     )
 
 
@@ -58,17 +58,15 @@ async def delete_keys(client: redis.Redis, keys: list[str]) -> int:
     for offset in range(0, len(keys), 500):
         batch = keys[offset : offset + 500]
         if batch:
-            deleted += int(await client.delete(*batch))
+            deleted += int(await client.unlink(*batch))
     return deleted
 
 
 async def audit(client: redis.Redis, prefix: str, top: int) -> dict[str, Any]:
     queue_prefix = f"{prefix}:webhook-queue:"
     job_prefix = f"{prefix}:job:"
-    result_prefix = f"{prefix}:result:"
     queue_count = 0
     job_count = 0
-    result_count = 0
     queue_entries = 0
     top_queues: list[tuple[int, str]] = []
 
@@ -80,15 +78,12 @@ async def audit(client: redis.Redis, prefix: str, top: int) -> dict[str, Any]:
             top_queues.append((length, key[len(queue_prefix) :]))
         elif key.startswith(job_prefix):
             job_count += 1
-        elif key.startswith(result_prefix):
-            result_count += 1
 
     top_queues.sort(reverse=True)
     memory = await client.info("memory")
     stats = await client.hgetall(f"{prefix}:stats")
     return {
         "database_keys": int(await client.dbsize()),
-        "delivery_results": result_count,
         "idempotency_index_entries": int(await client.zcard(f"{prefix}:idempotency:index")),
         "jobs": job_count,
         "memory": {
@@ -134,6 +129,8 @@ async def reconcile(client: redis.Redis, prefix: str) -> dict[str, Any]:
         index = 0
         while index < length:
             entries = await client.lrange(queue_key, index, min(index + 499, length - 1))
+            if not entries:
+                break
             for relative_index, entry in enumerate(entries):
                 absolute_index = index + relative_index
                 job_id, charge, entry_webhook_key = parse_queue_entry(entry)
@@ -248,11 +245,42 @@ async def purge_all(client: redis.Redis, prefix: str) -> dict[str, Any]:
     return {"deleted_keys": deleted, "matched_keys": matched, "prefix": prefix}
 
 
+async def purge_obsolete(client: redis.Redis, prefix: str) -> dict[str, Any]:
+    matched = 0
+    deleted = 0
+    batch: list[str] = []
+    async for key in client.scan_iter(
+        match=f"{prefix}:deadletter:*",
+        count=1000,
+    ):
+        batch.append(key)
+        matched += 1
+        if len(batch) >= 500:
+            deleted += await delete_keys(client, batch)
+            batch.clear()
+    deleted += await delete_keys(client, batch)
+    removed_stats = int(
+        await client.hdel(
+            f"{prefix}:stats",
+            "deadletter",
+            "deadletter_dropped",
+        )
+    )
+    return {
+        "deleted_keys": deleted,
+        "matched_keys": matched,
+        "removed_stats_fields": removed_stats,
+        "prefix": prefix,
+    }
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(prog="maintenance.py")
-    parser.add_argument("command", choices={"audit", "reconcile", "purge-all"})
+    parser.add_argument("command", choices={"audit", "reconcile", "purge-obsolete", "purge-all"})
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--prefix", default=env_value("QueuePrefix", "discord_proxy", ("QUEUE_PREFIX",)))
+    parser.add_argument("--confirm-offline", action="store_true")
+    parser.add_argument("--confirm-purge-all", action="store_true")
     args = parser.parse_args()
 
     redis_url = env_value("RedisUrl", "", ("REDIS_URL",)).strip()
@@ -265,8 +293,14 @@ async def main() -> None:
         if args.command == "audit":
             result = await audit(client, args.prefix, max(1, args.top))
         elif args.command == "reconcile":
+            if not args.confirm_offline:
+                raise SystemExit("reconcile requires --confirm-offline after all service replicas are stopped.")
             result = await reconcile(client, args.prefix)
+        elif args.command == "purge-obsolete":
+            result = await purge_obsolete(client, args.prefix)
         else:
+            if not args.confirm_purge_all:
+                raise SystemExit("purge-all requires --confirm-purge-all.")
             result = await purge_all(client, args.prefix)
         output(result)
     finally:
